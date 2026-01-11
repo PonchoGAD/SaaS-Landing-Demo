@@ -1,7 +1,7 @@
 SaaS Landing Demo
 
 Production-minded SaaS landing demo.
-Built to show clear thinking, structure, and delivery — not just visuals.
+Built to show clear thinking, structure, and delivery  not just visuals.
 
 What is this
 
@@ -23,9 +23,9 @@ Teams needing a fast marketing site
 
 Clients reviewing delivery quality
 
-Portfolio / demo purposes
+Portfolio  demo purposes
 
-If you need something clear, structured, and ready to deploy — this is the type of project.
+If you need something clear, structured, and ready to deploy  this is the type of project.
 
 What you see in 3 minutes
 
