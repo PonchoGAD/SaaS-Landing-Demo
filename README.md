@@ -1,69 +1,146 @@
-Production-minded demo SaaS landing.
-Built to show architecture, not just visuals.
+SaaS Landing Demo
 
+Production-minded SaaS landing demo.
+Built to show clear thinking, structure, and delivery — not just visuals.
 
+What is this
 
-# SaaS Landing Demo
+This is a minimal, finished SaaS landing built with modern Next.js architecture.
 
-Clean, production-ready SaaS landing built with Next.js App Router.
+The goal is simple:
+demonstrate how to launch a clean, SEO-ready commercial website quickly and without unnecessary complexity.
 
----
+This is not a template.
+This is a realistic MVP-level marketing site.
 
-## What is this
-A minimal SaaS landing page demonstrating how to quickly launch
-a commercial-ready website with i18n and SEO.
+Who this is for
 
-## Who is this for
-- Founders launching MVPs
-- Startups validating ideas
-- Teams needing a fast marketing site
-- Portfolio / demo projects
+Founders launching an MVP
 
-## What you see in 3 minutes
-- Clean SaaS UI
-- Pricing structure
-- FAQ & contact flow (mock)
-- Route-based i18n (EN / RU)
-- SEO-ready metadata
+Startups validating an idea
 
-## Live demo routes
-- /en  
-- /en/pricing  
-- /en/faq  
-- /en/contact  
+Teams needing a fast marketing site
 
-## Tech stack
-- Next.js (App Router)
-- React 18
-- Tailwind CSS
-- Route-based i18n
-- Static SEO metadata
+Clients reviewing delivery quality
 
-## How to demo (3 minutes)
-1. Open Home
-2. Review Pricing
-3. Switch locale (EN / RU)
-4. Submit contact form (mock)
+Portfolio / demo purposes
 
-## Deployment
-Ready for Vercel deployment with zero configuration.
+If you need something clear, structured, and ready to deploy — this is the type of project.
 
-## Limitations (intentional)
-- No backend
-- No database
-- No payments
-- No analytics
-- No animations
+What you see in 3 minutes
 
-## Future ideas (not implemented)
-- Real contact submission
-- CMS integration
-- Analytics
-- A/B testing
+In just a few minutes, you can evaluate:
 
-## Why this approach
-Minimal, finished, and easy to understand without a call.
+Clean SaaS-style UI
 
-## Dependency notes
-This is a demo project.
-Dependency warnings are intentionally not resolved to keep the setup minimal and reproducible.
+Clear value proposition
+
+Realistic pricing structure
+
+FAQ that removes objections
+
+Contact flow (mocked intentionally)
+
+Route-based i18n (EN / RU)
+
+SEO-ready metadata and structure
+
+No explanations needed.
+
+Live demo routes
+
+/en
+
+/en/pricing
+
+/en/faq
+
+/en/contact
+
+The root route automatically redirects to the default locale.
+
+Why this approach
+
+This project intentionally avoids over-engineering.
+
+No unnecessary features.
+No fake “AI”.
+No animations for the sake of animation.
+
+The focus is on:
+
+clarity
+
+speed
+
+structure
+
+trust
+
+Exactly what early-stage products need.
+
+Deployment
+
+The project is Vercel-ready.
+
+No environment variables required
+
+No external services
+
+One-click deploy
+
+Limitations (intentional)
+
+This is a marketing demo, not a full product.
+
+Intentionally excluded:
+
+Backend logic
+
+Database
+
+Authentication
+
+Payments
+
+Analytics
+
+CMS
+
+Complex animations
+
+Each of these would increase scope without improving the demo’s purpose.
+
+Future ideas (not implemented)
+
+These are intentionally not included, but the architecture allows them:
+
+Real contact submission (Server Actions)
+
+Backend API
+
+CMS (Sanity / Contentful)
+
+Analytics
+
+A/B testing
+
+They are excluded to keep the project minimal and focused.
+
+Summary
+
+This project shows how to:
+
+Think in MVP terms
+
+Respect scope boundaries
+
+Deliver something finished
+
+Build trust through simplicity
+
+It is designed to be understood without a call.
+
+Version
+
+v1.0.1

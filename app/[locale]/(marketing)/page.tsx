@@ -3,9 +3,12 @@ import FeatureGrid from '@/components/marketing/FeatureGrid';
 
 export default function HomePage() {
   return (
-    <>
+    <main className="space-y-32">
       <Hero />
-      <FeatureGrid />
-    </>
+
+      <section className="mx-auto max-w-6xl px-6">
+        <FeatureGrid />
+      </section>
+    </main>
   );
 }

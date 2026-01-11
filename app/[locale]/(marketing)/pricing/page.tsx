@@ -6,14 +6,20 @@ export const metadata = {
 
 export default function PricingPage() {
   return (
-    <section className="py-20">
-      <h1 className="text-3xl font-bold">Pricing</h1>
-      <p className="mt-4 text-gray-600">
-        Simple plans for early-stage SaaS products.
-      </p>
-      <div className="mt-12">
+    <main className="py-32">
+      <section className="mx-auto max-w-3xl px-6 text-center">
+        <h1 className="text-4xl font-bold tracking-tight">
+          Pricing
+        </h1>
+
+        <p className="mt-4 text-lg text-muted">
+          Simple, transparent pricing for early-stage SaaS products.
+        </p>
+      </section>
+
+      <section className="mt-20 px-6">
         <PricingTable />
-      </div>
-    </section>
+      </section>
+    </main>
   );
 }
