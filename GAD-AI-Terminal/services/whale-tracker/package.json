@@ -1,0 +1,11 @@
+{
+  "name": "@service/whale-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev --respawn --transpile-only --project tsconfig.json src/index.ts"
+  }
+}
