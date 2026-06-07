@@ -1,0 +1,143 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: gad-ai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gad}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gadpass}
+      POSTGRES_DB: ${POSTGRES_DB:-gad_ai}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gad}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  redis:
+    image: redis:7-alpine
+    container_name: gad-ai-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    container_name: gad-ai-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+  scanner:
+    build:
+      context: .
+      dockerfile: services/scanner/Dockerfile
+    container_name: gad-ai-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    depends_on:
+      api:
+        condition: service_started
+      redis:
+        condition: service_healthy
+  telegram:
+    build:
+      context: .
+      dockerfile: services/telegram/Dockerfile
+    container_name: gad-ai-telegram
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    depends_on:
+      api:
+        condition: service_started
+  whale-tracker:
+    build:
+      context: .
+      dockerfile: services/whale-tracker/Dockerfile
+    container_name: gad-ai-whale-tracker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    depends_on:
+      api:
+        condition: service_started
+  autobuy:
+    build:
+      context: .
+      dockerfile: services/autobuy/Dockerfile
+    container_name: gad-ai-autobuy
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    depends_on:
+      api:
+        condition: service_started
+  dashboard:
+    build:
+      context: services/dashboard
+      dockerfile: Dockerfile
+    container_name: gad-ai-dashboard
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_started
+  landing:
+    build:
+      context: services/landing
+      dockerfile: Dockerfile
+    container_name: gad-ai-landing
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "3001:3001"
+  social-monitor:
+    build:
+      context: .
+      dockerfile: services/social-monitor/Dockerfile
+    container_name: gad-ai-social-monitor
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      SOCIAL_POLL_INTERVAL_SECONDS: "120"
+    depends_on:
+      api:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+volumes:
+  postgres-data:

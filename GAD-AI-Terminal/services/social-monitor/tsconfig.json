@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "isolatedModules": false,
+    "paths": {
+      "@lib/db":        ["../../libs/db/src/index.d.ts"],
+      "@lib/narrative": ["../../libs/narrative/src/index.d.ts"]
+    }
+  },
+  "include": [
+    "src/**/*",
+    "../../libs/db/src/index.d.ts",
+    "../../libs/narrative/src/index.d.ts"
+  ]
+}
