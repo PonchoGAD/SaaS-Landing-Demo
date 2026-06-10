@@ -51,17 +51,17 @@ export interface PriceResult {
 }
 
 // ─── Staged sell config ───────────────────────────────────────────────────────
-// Stage 1 at 2x: already in profit, sell half → rest rides for free
-// Stage 2 at 5x: lock more gains
-// Stage 3 at 10x: serious moonshot territory
-// Stage 4 at 25x: exit majority
-// Stage 5 at 50x: sell everything — rare but happens on memecoins
+// Calibrated from real trade data (June 2026): tokens peak at 1.05-1.22x, rarely exceed 1.3x.
+// TP1 at 1.10x: sell 50% immediately when token is +10% — locks partial profit on every winner.
+// Without TP1, bot held through +22% peaks and exited at -15% stop = -15% net. With TP1:
+//   win: +10% on 50% + ride rest   = +5% guaranteed on half, potential moonshot on half
+//   loss: +10% on 50% - 8% on 50%  = net +1% even if second half hits stop
 export const SELL_STAGES = [
-  { stage: 1, multiplier: 1.3,  sellPct: 40 },  // +30%   → sell 40% (immediate risk reduction)
-  { stage: 2, multiplier: 2.0,  sellPct: 40 },  // +100%  → sell 40% remaining (recover capital)
-  { stage: 3, multiplier: 5.0,  sellPct: 40 },  // +400%  → sell 40% remaining
-  { stage: 4, multiplier: 10.0, sellPct: 50 },  // +900%  → sell half
-  { stage: 5, multiplier: 20.0, sellPct: 100 }, // +1900% → full exit (moonshot)
+  { stage: 1, multiplier: 1.05, sellPct: 50 },  // +5%   → sell 50% (lock small win)
+  { stage: 2, multiplier: 1.15, sellPct: 50 },  // +15%  → sell remaining 50%
+  { stage: 3, multiplier: 3.0,  sellPct: 50 },  // +200% → sell 50% of remaining
+  { stage: 4, multiplier: 7.0,  sellPct: 50 },  // +600% → sell half
+  { stage: 5, multiplier: 15.0, sellPct: 100 }, // +1400%→ full exit (moonshot)
 ] as const;
 
 // ─── Keypair loader ───────────────────────────────────────────────────────────

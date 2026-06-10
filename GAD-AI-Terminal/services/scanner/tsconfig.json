@@ -1,0 +1,26 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "isolatedModules": false,
+    "paths": {
+      "@lib/db":          ["../../libs/db/src/index.d.ts"],
+      "@lib/solana":      ["../../libs/solana/src/index.d.ts"],
+      "@lib/risk":        ["../../libs/risk/src/index.d.ts"],
+      "@lib/scoring":     ["../../libs/scoring/src/index.d.ts"],
+      "@lib/alerts":      ["../../libs/alerts/src/index.d.ts"],
+      "@lib/narrative":   ["../../libs/narrative/src/index.d.ts"],
+      "@lib/social":      ["../../libs/social/src/index.d.ts"],
+      "@lib/rug":         ["../../libs/rug/src/index.d.ts"],
+      "@lib/survival":    ["../../libs/survival/src/index.d.ts"],
+      "@lib/gad-score":   ["../../libs/gad-score/src/index.d.ts"],
+      "@lib/lifecycle":   ["../../libs/lifecycle/src/index.d.ts"],
+      "@lib/opportunity": ["../../libs/opportunity/src/index.d.ts"],
+      "@lib/memory":      ["../../libs/memory/src/index.d.ts"],
+      "@lib/regime":      ["../../libs/regime/src/index.d.ts"],
+      "@lib/reputation":  ["../../libs/reputation/src/index.d.ts"]
+    }
+  },
+  "include": ["src/**/*"]
+}

@@ -1,0 +1,3 @@
+- No fear, no inevitability, no manipulation
+- No dependency building
+- If missing time_of_birth: state limits explicitly

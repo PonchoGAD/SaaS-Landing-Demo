@@ -1,0 +1,27 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "isolatedModules": false,
+    "paths": {
+      "@lib/db":          ["../../libs/db/src/index.d.ts"],
+      "@lib/autobuy":     ["../../libs/autobuy/src/index.d.ts"],
+      "@lib/trend":       ["../../libs/trend/src/index.d.ts"],
+      "@lib/liqhealth":   ["../../libs/liqhealth/src/index.d.ts"],
+      "@lib/hype":        ["../../libs/hype/src/index.d.ts"],
+      "@lib/walletintel": ["../../libs/walletintel/src/index.d.ts"],
+      "@lib/botshield":   ["../../libs/botshield/src/index.d.ts"]
+    }
+  },
+  "include": [
+    "src/**/*",
+    "../../libs/db/src/index.d.ts",
+    "../../libs/autobuy/src/index.d.ts",
+    "../../libs/trend/src/index.d.ts",
+    "../../libs/liqhealth/src/index.d.ts",
+    "../../libs/hype/src/index.d.ts",
+    "../../libs/walletintel/src/index.d.ts",
+    "../../libs/botshield/src/index.d.ts"
+  ]
+}

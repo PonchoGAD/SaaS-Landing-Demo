@@ -1,5 +1,6 @@
 import { Application, Request, Response } from 'express';
 import { query, transaction } from '@lib/db';
+import launcherRouter from './launcher.routes';
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 function isValidMint(mint: string): boolean {
@@ -34,6 +35,12 @@ async function hasActiveSubscription(walletAddress: string): Promise<boolean> {
 }
 
 export function registerRoutes(app: Application) {
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // COIN LAUNCHER
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  app.use('/launcher', launcherRouter);
 
   // ═══════════════════════════════════════════════════════════════════════════
   // TOKENS
@@ -630,6 +637,279 @@ export function registerRoutes(app: Application) {
     });
   });
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TRADE JOURNAL (Sprint 14)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** GET /journal?limit=50 — full trade history with P&L from autobuy_jobs */
+  app.get('/journal', async (req: Request, res: Response) => {
+    await safeRes(res, async () => {
+      const limit = Math.min(Number(req.query.limit ?? 50), 200);
+      const { rows } = await query(`
+        SELECT
+          j.id, j.mint_address, j.label, j.amount_sol,
+          j.entry_price_sol, j.bought_at, j.last_activity_at,
+          j.total_sold_sol, j.sell_stage_reached, j.active,
+          j.last_error,
+          CASE WHEN j.entry_price_sol IS NOT NULL
+            THEN ROUND((j.total_sold_sol - j.amount_sol)::numeric, 6)
+            ELSE NULL
+          END AS pnl_sol,
+          CASE WHEN j.amount_sol > 0 AND j.entry_price_sol IS NOT NULL
+            THEN ROUND(((j.total_sold_sol - j.amount_sol) / j.amount_sol * 100)::numeric, 1)
+            ELSE NULL
+          END AS roi_pct,
+          t.symbol, t.name,
+          (SELECT json_agg(json_build_object(
+            'stage', s.stage_number, 'status', s.status,
+            'sol', s.sol_received, 'reason', s.sell_reason, 'at', s.executed_at
+          ) ORDER BY s.stage_number)
+           FROM autosell_stages s WHERE s.autobuy_job_id = j.id) AS stages
+        FROM autobuy_jobs j
+        LEFT JOIN tokens t ON t.mint_address = j.mint_address
+        WHERE j.label LIKE 'auto:%' AND j.entry_price_sol IS NOT NULL
+        ORDER BY j.bought_at DESC NULLS LAST
+        LIMIT $1
+      `, [limit]);
+
+      const summary = await query(`
+        SELECT
+          COUNT(*)                                                    AS total_trades,
+          COALESCE(SUM(amount_sol), 0)                               AS total_spent,
+          COALESCE(SUM(total_sold_sol), 0)                           AS total_received,
+          COUNT(*) FILTER (WHERE total_sold_sol > amount_sol)        AS wins,
+          COUNT(*) FILTER (WHERE total_sold_sol <= amount_sol
+                             AND total_sold_sol > 0)                  AS losses,
+          COUNT(*) FILTER (WHERE total_sold_sol = 0)                 AS zero_exits,
+          COALESCE(AVG(EXTRACT(EPOCH FROM (last_activity_at - bought_at)) / 60)
+            FILTER (WHERE bought_at IS NOT NULL
+              AND last_activity_at IS NOT NULL), 0)                  AS avg_hold_min
+        FROM autobuy_jobs
+        WHERE label LIKE 'auto:%' AND entry_price_sol IS NOT NULL
+      `);
+      const s = summary.rows[0];
+      const totalPnl = Number(s.total_received) - Number(s.total_spent);
+
+      res.json({
+        trades: rows,
+        summary: {
+          total_trades:  Number(s.total_trades),
+          total_spent:   Number(s.total_spent),
+          total_received:Number(s.total_received),
+          total_pnl:     Math.round(totalPnl * 10000) / 10000,
+          wins:          Number(s.wins),
+          losses:        Number(s.losses),
+          zero_exits:    Number(s.zero_exits),
+          win_rate:      Number(s.total_trades) > 0
+            ? Math.round((Number(s.wins) / Number(s.total_trades)) * 100) : 0,
+          avg_hold_min:  Math.round(Number(s.avg_hold_min)),
+        }
+      });
+    });
+  });
+
+  /** GET /journal/export — CSV download of trade history */
+  app.get('/journal/export', async (_req, res: Response) => {
+    await safeRes(res, async () => {
+      const { rows } = await query(`
+        SELECT
+          j.id, j.mint_address, t.symbol, j.amount_sol,
+          j.entry_price_sol, j.bought_at,
+          j.total_sold_sol, j.sell_stage_reached, j.label,
+          j.last_error,
+          ROUND((j.total_sold_sol - j.amount_sol)::numeric, 6) AS pnl_sol,
+          ROUND(((j.total_sold_sol - j.amount_sol) / j.amount_sol * 100)::numeric, 1) AS roi_pct
+        FROM autobuy_jobs j
+        LEFT JOIN tokens t ON t.mint_address = j.mint_address
+        WHERE j.label LIKE 'auto:%' AND j.entry_price_sol IS NOT NULL
+        ORDER BY j.bought_at DESC NULLS LAST
+      `);
+      const header = 'id,mint,symbol,spent_sol,entry_price_sol,bought_at,received_sol,stage,pnl_sol,roi_pct,label,error\n';
+      const csv = header + rows.map((r: any) =>
+        [r.id, r.mint_address, r.symbol ?? '', r.amount_sol, r.entry_price_sol ?? '',
+         r.bought_at ? new Date(r.bought_at).toISOString() : '',
+         r.total_sold_sol, r.sell_stage_reached, r.pnl_sol ?? '', r.roi_pct ?? '',
+         `"${(r.label ?? '').replace(/"/g, '""')}"`,
+         `"${(r.last_error ?? '').replace(/"/g, '""')}"`
+        ].join(',')
+      ).join('\n');
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', 'attachment; filename="trade_journal.csv"');
+      res.send(csv);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // RISK PASSPORT (Sprint 14)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** GET /riskpassport — personal trading risk profile from autobuy_jobs history */
+  app.get('/riskpassport', async (_req, res: Response) => {
+    await safeRes(res, async () => {
+      const { rows } = await query(`
+        SELECT
+          j.id, j.amount_sol, j.total_sold_sol, j.label,
+          j.entry_price_sol, j.bought_at, j.last_activity_at,
+          EXTRACT(EPOCH FROM (j.last_activity_at - j.bought_at)) / 60 AS hold_min,
+          (j.total_sold_sol - j.amount_sol) AS pnl_sol
+        FROM autobuy_jobs j
+        WHERE j.label LIKE 'auto:%' AND j.entry_price_sol IS NOT NULL
+        ORDER BY j.bought_at DESC
+      `);
+
+      const trades = rows.map((r: any) => ({
+        pnl: Number(r.pnl_sol),
+        spent: Number(r.amount_sol),
+        received: Number(r.total_sold_sol),
+        holdMin: Number(r.hold_min ?? 0),
+        label: r.label ?? '',
+      }));
+
+      const total = trades.length;
+      if (total === 0) {
+        return res.json({ passport: null, message: 'No trades yet. Start trading to build your Risk Passport.' });
+      }
+
+      const wins = trades.filter(t => t.pnl > 0);
+      const losses = trades.filter(t => t.pnl < 0 && t.received > 0);
+      const zeros  = trades.filter(t => t.received === 0);
+
+      const winRate   = Math.round((wins.length / total) * 100);
+      const avgHold   = Math.round(trades.reduce((s, t) => s + t.holdMin, 0) / total);
+      const totalPnl  = trades.reduce((s, t) => s + t.pnl, 0);
+      const totalSpent = trades.reduce((s, t) => s + t.spent, 0);
+      const roi       = totalSpent > 0 ? Math.round((totalPnl / totalSpent) * 100) : 0;
+
+      const avgWin  = wins.length  ? wins.reduce((s,t)  => s + t.pnl, 0) / wins.length  : 0;
+      const avgLoss = losses.length ? losses.reduce((s,t) => s + t.pnl, 0) / losses.length : 0;
+      const rr      = avgLoss !== 0 ? Math.abs(avgWin / avgLoss).toFixed(2) : 'N/A';
+
+      const t1Trades = trades.filter(t => t.label.includes(':t1'));
+      const t2Trades = trades.filter(t => t.label.includes(':t2'));
+      const t3Trades = trades.filter(t => t.label.includes(':t3'));
+
+      const tierWR = (ts: typeof trades) => ts.length
+        ? Math.round(ts.filter(t => t.pnl > 0).length / ts.length * 100) : null;
+
+      // Risk score (0=reckless, 100=disciplined)
+      let riskScore = 50;
+      if (zeros.length / total > 0.3) riskScore -= 20;
+      if (winRate < 30) riskScore -= 15;
+      if (avgHold < 5) riskScore -= 10;  // too fast in/out (likely stop-losses)
+      if (avgHold > 15) riskScore += 10;
+      if (roi > 0) riskScore += 15;
+      if (roi > 20) riskScore += 10;
+      if (total >= 20) riskScore += 5;
+      riskScore = Math.max(0, Math.min(100, riskScore));
+
+      const profile = riskScore >= 70 ? 'DISCIPLINED' : riskScore >= 40 ? 'LEARNING' : 'HIGH_RISK';
+
+      res.json({
+        passport: {
+          total_trades: total,
+          win_rate: winRate,
+          total_pnl_sol: Math.round(totalPnl * 10000) / 10000,
+          roi_pct: roi,
+          avg_hold_min: avgHold,
+          risk_reward: rr,
+          wins: wins.length,
+          losses: losses.length,
+          zero_exits: zeros.length,
+          risk_score: riskScore,
+          profile,
+          tier_breakdown: {
+            t1: { trades: t1Trades.length, win_rate: tierWR(t1Trades) },
+            t2: { trades: t2Trades.length, win_rate: tierWR(t2Trades) },
+            t3: { trades: t3Trades.length, win_rate: tierWR(t3Trades) },
+          },
+          advice: buildRiskAdvice(winRate, avgHold, zeros.length, total, roi),
+        }
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TOKEN SCORE (Sprint 14)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** GET /tokenscore/:mint — transparency & safety score for a token */
+  app.get('/tokenscore/:mint', async (req: Request, res: Response) => {
+    await safeRes(res, async () => {
+      const { mint } = req.params;
+
+      const [tokenQ, rugQ, metricsQ] = await Promise.all([
+        query('SELECT * FROM tokens WHERE mint_address = $1', [mint]),
+        query('SELECT * FROM rug_scores WHERE token_id = (SELECT id FROM tokens WHERE mint_address = $1) ORDER BY checked_at DESC LIMIT 1', [mint]),
+        query('SELECT * FROM token_metrics WHERE token_id = (SELECT id FROM tokens WHERE mint_address = $1) ORDER BY timestamp DESC LIMIT 1', [mint]),
+      ]);
+
+      const token   = tokenQ.rows[0] ?? null;
+      const rug     = rugQ.rows[0] ?? null;
+      const metric  = metricsQ.rows[0] ?? null;
+
+      // ── Score components ──
+      const rugProb = rug ? Number(rug.rug_probability ?? 50) : 50;
+      const liqUsd  = metric ? Number(metric.liquidity_usd ?? 0) : Number(token?.liquidity ?? 0);
+      const holders = token ? Number(token.holder_count ?? 0) : 0;
+      const ageMs   = token?.first_seen
+        ? Date.now() - new Date(token.first_seen).getTime() : 0;
+      const ageDays = ageMs / (1000 * 60 * 60 * 24);
+
+      // 1. Rug safety (0-40): inversely proportional to rug probability
+      const rugScore = Math.round(Math.max(0, 40 - (rugProb * 0.4)));
+
+      // 2. Liquidity health (0-25)
+      const liqScore =
+        liqUsd >= 100000 ? 25 :
+        liqUsd >= 50000  ? 20 :
+        liqUsd >= 20000  ? 15 :
+        liqUsd >= 5000   ? 8  : 3;
+
+      // 3. Community (0-20): holder count
+      const holderScore = Math.min(20, Math.round((holders / 1000) * 20));
+
+      // 4. Transparency (0-15): metadata completeness + age
+      let transparencyScore = 0;
+      if (token?.symbol) transparencyScore += 3;
+      if (token?.name)   transparencyScore += 3;
+      if (ageDays >= 7)  transparencyScore += 3;
+      if (ageDays >= 30) transparencyScore += 3;
+      if (rug?.honeypot === false) transparencyScore += 3;
+
+      const totalScore = rugScore + liqScore + holderScore + transparencyScore;
+
+      const label =
+        totalScore >= 85 ? 'SAFE' :
+        totalScore >= 70 ? 'MODERATE' :
+        totalScore >= 50 ? 'RISKY' : 'DANGEROUS';
+
+      const flags: string[] = [];
+      if (rugProb > 60) flags.push(`High rug probability: ${rugProb.toFixed(0)}%`);
+      if (rug?.honeypot === true) flags.push('Honeypot detected');
+      if (liqUsd < 5000) flags.push('Very low liquidity');
+      if (holders < 50 && holders > 0) flags.push('Too few holders (<50)');
+      if (ageDays < 1) flags.push('Very new token (<24h)');
+
+      res.json({
+        mint,
+        symbol: token?.symbol ?? null,
+        score: totalScore,
+        label,
+        components: {
+          rug_safety: rugScore,
+          liquidity: liqScore,
+          community: holderScore,
+          transparency: transparencyScore,
+        },
+        flags,
+        rug_probability: rugProb,
+        liquidity_usd: liqUsd,
+        holder_count: holders,
+        age_days: Math.round(ageDays * 10) / 10,
+      });
+    });
+  });
+
   /** GET /narratives — trending narratives */
   app.get('/narratives', async (_req, res: Response) => {
     await safeRes(res, async () => {
@@ -677,6 +957,18 @@ function buildBearCase(ctx: { riskScore: number; activeAlerts: any[]; metric: an
   const liqChange = Number(ctx.metric?.liquidity_change ?? 0);
   if (liqChange < -15) points.push(`Recent liquidity declined ${Math.abs(liqChange).toFixed(1)}%.`);
   return points.length ? points : ['No significant bear signals identified.'];
+}
+
+function buildRiskAdvice(winRate: number, avgHold: number, zeros: number, total: number, roi: number): string[] {
+  const advice: string[] = [];
+  if (zeros / total > 0.3) advice.push('30%+ of trades ended with 0 SOL received — check if tokens are sellable before buying.');
+  if (winRate < 30) advice.push('Win rate below 30%. Consider tighter entry filters or waiting for stronger momentum signals.');
+  if (avgHold < 5) advice.push(`Average hold ${avgHold}min — very short. Stop-loss may be too tight (check STOP_LOSS_PCT env).`);
+  if (avgHold > 30) advice.push(`Average hold ${avgHold}min — holding longer may expose you to time-limit dumps.`);
+  if (roi < -20) advice.push('ROI below -20%. Review entry filters (Birdeye holder count, momentum gates).');
+  if (roi > 0) advice.push('Positive ROI — good. Focus on increasing position sizing on winning setups.');
+  if (!advice.length) advice.push('Portfolio looks balanced. Keep monitoring entry quality.');
+  return advice;
 }
 
 function buildRecommendation(aiScore: number, riskScore: number): string {

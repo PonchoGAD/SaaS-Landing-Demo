@@ -9,23 +9,24 @@ import {
 } from '@lib/autobuy';
 import { sellViaPumpPortal, buyViaPumpPortal } from './pumpportal';
 import { PublicKey } from '@solana/web3.js';
-import { processAutoSignals, AUTO_BUY_ENABLED } from './auto-signal';
+import { processAutoSignals, processRaydiumOpportunities, AUTO_BUY_ENABLED, getLiqTier } from './auto-signal';
 
 const POLL_MS    = Number(process.env.AUTOBUY_POLL_SECONDS  || '15') * 1000;
 const MAX_ERRORS = Number(process.env.AUTOBUY_MAX_ERRORS    || '5');
 
-const AUTOSELL_SLIPPAGE_BPS = Number(process.env.AUTOSELL_SLIPPAGE_BPS || '150');
+const AUTOSELL_SLIPPAGE_BPS      = Number(process.env.AUTOSELL_SLIPPAGE_BPS       || '500');
+const AUTOSELL_SLIPPAGE_RETRY_BPS = Number(process.env.AUTOSELL_SLIPPAGE_RETRY_BPS || '1000');
 const AUTOBUY_SLIPPAGE_BPS  = Number(process.env.AUTOBUY_SLIPPAGE_BPS  || '100');
 
 // Stop-loss: sell ALL if price drops this % below entry (0 = disabled)
-const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || '15') / 100;
+const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || '5') / 100;   // was 8%
 
 // Trailing stop: after first TP stage, sell ALL if price drops TRAIL_PCT from peak
-const TRAIL_PCT = Number(process.env.TRAIL_PCT || '20') / 100;
+const TRAIL_PCT = Number(process.env.TRAIL_PCT || '12') / 100;           // was 15%
 
 // Time limit: sell 95% if token shows no price activity for this many seconds
-const TIME_LIMIT_SECONDS      = Number(process.env.TIME_LIMIT_SECONDS      || '3600');
-const TIME_LIMIT_ACTIVITY_PCT = Number(process.env.TIME_LIMIT_ACTIVITY_PCT || '0.5') / 100;
+const TIME_LIMIT_SECONDS      = Number(process.env.TIME_LIMIT_SECONDS      || '1200');  // was 1800 (30min) → 20min
+const TIME_LIMIT_ACTIVITY_PCT = Number(process.env.TIME_LIMIT_ACTIVITY_PCT || '3') / 100;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -56,6 +57,7 @@ interface AutosellStage {
   bought_at: string | null;
   last_activity_at: string | null;
   sell_stage_reached: number; // how many TP stages already executed (for trailing stop)
+  label: string | null;
 }
 
 // ─── In-memory state ─────────────────────────────────────────────────────────
@@ -77,6 +79,15 @@ const prevPriceMap = new Map<string, number>();
 
 // Peak price tracking for trailing stop (mint → highest price seen)
 const peakPriceMap = new Map<string, number>();
+
+// Peak price tracking for early trail (pre-TP1) — separate from post-TP1 trail
+const earlyPeakMap = new Map<string, number>();
+
+// Stop-loss confirmation counter — require N consecutive readings below stop before firing.
+// Prevents stop-hunts: whales briefly dip price below stop then immediately recover.
+// Set to 1 for immediate stop (memecoins can drop 20% in 30s if we wait for 2 confirms).
+const stopLossConfirmCount = new Map<string, number>();
+const STOP_LOSS_CONFIRMS_REQUIRED = Number(process.env.STOP_LOSS_CONFIRMS || '1');
 
 // ─── Buy helpers ──────────────────────────────────────────────────────────────
 
@@ -138,14 +149,36 @@ async function markBuyError(jobId: string, error: string, intervalSeconds: numbe
   }
 }
 
+// ─── Extract tier from job label ──────────────────────────────────────────────
+// Labels: auto:raydium_scan:liq250k:fresh2h:t3  →  tier 3
+function getTierFromLabel(label: string | null): ReturnType<typeof getLiqTier> {
+  if (label?.includes(':t3')) {
+    // Extract liq from label to get exact tier config
+    const liqMatch = label.match(/:liq(\d+)k/);
+    const liq = liqMatch ? Number(liqMatch[1]) * 1000 : 300000;
+    return getLiqTier(Math.max(liq, 250001));  // force T3
+  }
+  if (label?.includes(':t1')) {
+    const liqMatch = label.match(/:liq(\d+)k/);
+    const liq = liqMatch ? Number(liqMatch[1]) * 1000 : 50000;
+    return getLiqTier(Math.min(liq, 79999));   // force T1
+  }
+  // Default: T2 or derive from liq in label
+  const liqMatch = label?.match(/:liq(\d+)k/);
+  if (liqMatch) return getLiqTier(Number(liqMatch[1]) * 1000);
+  return getLiqTier(100000);  // fallback to T2
+}
+
 // ─── Create sell stages after a buy ──────────────────────────────────────────
 
 async function createSellStages(
   jobId: string, mintAddress: string, walletAddress: string,
-  entryPriceSol: number, tokensBought: bigint
+  entryPriceSol: number, tokensBought: bigint, jobLabel: string | null
 ) {
+  const tier = getTierFromLabel(jobLabel);
+  const stages = tier.sellStages;
   let tokensRemaining = tokensBought;
-  for (const stage of SELL_STAGES) {
+  for (const stage of stages) {
     const tokensForStage = tokensRemaining;
     const tokensSold = BigInt(Math.floor(Number(tokensForStage) * stage.sellPct / 100));
     tokensRemaining -= tokensSold;
@@ -159,7 +192,7 @@ async function createSellStages(
        stage.multiplier, stage.sellPct, tokensForStage.toString()]
     );
   }
-  console.info(`[autobuy] Created ${SELL_STAGES.length} sell stages for job ${jobId.slice(0,8)}`);
+  console.info(`[autobuy] Created ${stages.length} sell stages (T${tier.tier}) for job ${jobId.slice(0,8)} — TP targets: ${stages.map(s => `${s.multiplier}x`).join('→')}`);
 }
 
 // ─── Sell stage fetching ──────────────────────────────────────────────────────
@@ -173,7 +206,8 @@ async function fetchPendingSellStages(): Promise<AutosellStage[]> {
             j.time_limit_enabled,
             j.bought_at,
             j.last_activity_at,
-            COALESCE(j.sell_stage_reached, 0) AS sell_stage_reached
+            COALESCE(j.sell_stage_reached, 0) AS sell_stage_reached,
+            j.label
      FROM autosell_stages s
      JOIN autobuy_jobs j ON j.id = s.autobuy_job_id
      WHERE s.status = 'pending'
@@ -194,7 +228,8 @@ async function claimAndSell(
   sellPct: number,
   reason: 'STOP_LOSS' | 'TIME_LIMIT_EXPIRED',
   connection: ReturnType<typeof getConnection>,
-  keypair: ReturnType<typeof getKeypairFromEnv>
+  keypair: ReturnType<typeof getKeypairFromEnv>,
+  isJupiterOnly = false   // true for Raydium-track tokens — never use PumpPortal fallback
 ): Promise<'success' | 'fail'> {
   if (!keypair) return 'fail';
 
@@ -233,10 +268,20 @@ async function claimAndSell(
   }
   const stageIds = claimed.map(r => r.id);
 
-  const sellResult = await executeAutoSell(
+  // Attempt 1: normal slippage
+  let sellResult = await executeAutoSell(
     { mintAddress: mint, tokenAmount: tokensToSell, slippageBps: AUTOSELL_SLIPPAGE_BPS },
     connection, keypair
   );
+
+  // Attempt 2: if failed, retry with high slippage before giving up
+  if (!sellResult.success) {
+    console.warn(`[sell] Jupiter attempt 1 failed for ${mint.slice(0,8)}, retrying with ${AUTOSELL_SLIPPAGE_RETRY_BPS}bps slippage...`);
+    sellResult = await executeAutoSell(
+      { mintAddress: mint, tokenAmount: tokensToSell, slippageBps: AUTOSELL_SLIPPAGE_RETRY_BPS },
+      connection, keypair
+    );
+  }
 
   if (sellResult.success) {
     await query(
@@ -254,10 +299,16 @@ async function claimAndSell(
     return 'success';
   }
 
-  // Jupiter failed — try PumpPortal as fallback (handles pump.fun/pumpswap/fluxbeam)
+  // Jupiter exhausted — PumpPortal fallback ONLY for pump.fun/pumpswap tokens (not Raydium)
+  if (isJupiterOnly) {
+    console.error(`[sell] Jupiter failed twice for Raydium token ${mint.slice(0,8)} — skipping PumpPortal (wrong DEX), will retry next cycle`);
+    await query(`UPDATE autosell_stages SET status='pending' WHERE id=ANY($1)`, [stageIds]);
+    return 'fail';
+  }
+
   console.warn(`[sell] Jupiter failed for ${mint.slice(0,8)}, trying PumpPortal fallback...`);
   const ppResult = await sellViaPumpPortal(mint, sellPct, keypair, connection);
-  if (ppResult.success) {
+  if (ppResult.success && (ppResult.solReceived ?? 0) > 0) {
     await query(
       `UPDATE autosell_stages
          SET status = 'executed', sol_received = $1, tx_signature = $2,
@@ -328,73 +379,160 @@ async function checkAndExecuteSells(walletAddress: string) {
     }
 
     // ── Activity tracking (for time limit reset) ──────────────────────────────
+    // ONLY reset timer on UPWARD moves — downward moves should NOT extend a losing position.
+    // A 17% dump is not "activity" worth waiting for, it means the trade is failing.
     const prev = prevPriceMap.get(mint);
     prevPriceMap.set(mint, currentPriceSol);
-    if (prev !== undefined && prev > 0 && currentPriceSol > 0) {
-      const pctChange = Math.abs((currentPriceSol - prev) / prev);
-      if (pctChange >= TIME_LIMIT_ACTIVITY_PCT) {
+    const refEntry = Number(refStage.entry_price_sol ?? 0);
+    if (prev !== undefined && prev > 0 && currentPriceSol > prev) {
+      const pctChange = (currentPriceSol - prev) / prev;
+      // Only count as activity when price is rising AND above entry (real momentum, not dead-cat bounce)
+      if (pctChange >= TIME_LIMIT_ACTIVITY_PCT && (refEntry === 0 || currentPriceSol >= refEntry)) {
         await query(
           `UPDATE autobuy_jobs SET last_activity_at = now() WHERE id = $1`,
           [refStage.autobuy_job_id]
         );
         console.info(
-          `[time-limit] 📊 Activity on ${mint.slice(0,8)}: ${(pctChange * 100).toFixed(2)}% price change — timer reset`
+          `[time-limit] 📊 Activity on ${mint.slice(0,8)}: +${(pctChange * 100).toFixed(2)}% ↑ above entry — timer reset`
         );
+      }
+    }
+
+    // ── Tier config for this job ──────────────────────────────────────────────
+    const jobTier = getTierFromLabel(refStage.label);
+
+    // ── Hard cap: max hold time from buy regardless of activity ───────────────
+    // T1=30min, T2=60min, T3=4h (mid-caps can take time to move)
+    const tierHardCap = jobTier.tier === 1 ? 1800 : jobTier.tier === 3 ? 14400 : 3600;
+    const MAX_HOLD_SECONDS = Number(process.env.MAX_HOLD_SECONDS || String(tierHardCap));
+    if (refStage.bought_at) {
+      const totalElapsedSec = (Date.now() - new Date(refStage.bought_at).getTime()) / 1000;
+      if (totalElapsedSec > MAX_HOLD_SECONDS) {
+        const elapsedMin = Math.floor(totalElapsedSec / 60);
+        console.warn(
+          `[time-limit] 🔴 HARD CAP ${mint.slice(0,8)} — held ${elapsedMin}min (max ${MAX_HOLD_SECONDS / 60}min) — force sell`
+        );
+        const result = await claimAndSell(mint, refStage.autobuy_job_id, 95, 'TIME_LIMIT_EXPIRED', connection, keypair, !refStage.label?.includes(':pumpportal'));
+        if (result === 'success') {
+          console.info(`[time-limit] ✅ Hard cap sell EXECUTED for ${mint.slice(0,8)}`);
+        }
+        continue;
+      }
+    }
+
+    // ── Early trailing stop (pre-TP1: activates once position is profitable) ──
+    // Solves the core loss pattern: token peaks +15% → falls to stop at -8% = net -8% loss.
+    // With early trail: peaks +15%, trail fires at +9% (6% below peak) = +9% gain.
+    // Only fires when trail-stop price > entry (guarantees we sell at a profit, never a loss).
+    const EARLY_TRAIL_PCT = jobTier.earlyTrailPct;
+    if (EARLY_TRAIL_PCT > 0 && refEntry > 0 && refStage.sell_stage_reached === 0) {
+      const prevEarlyPeak = earlyPeakMap.get(mint) ?? currentPriceSol;
+      const newEarlyPeak = Math.max(prevEarlyPeak, currentPriceSol);
+      earlyPeakMap.set(mint, newEarlyPeak);
+      const earlyStop = newEarlyPeak * (1 - EARLY_TRAIL_PCT);
+      // Only fire if selling above entry+1% — we must be locking a profit, not a loss
+      if (currentPriceSol < earlyStop && earlyStop > refEntry * 1.003) {
+        const gainPct = ((currentPriceSol / refEntry - 1) * 100).toFixed(1);
+        const peakPct = ((newEarlyPeak / refEntry - 1) * 100).toFixed(1);
+        console.warn(
+          `[autosell] 💰 EARLY TRAIL ${mint.slice(0,8)} — ` +
+          `selling at +${gainPct}% (peak was +${peakPct}%, trail -${(EARLY_TRAIL_PCT * 100).toFixed(0)}% from peak)`
+        );
+        const result = await claimAndSell(mint, refStage.autobuy_job_id, 100, 'STOP_LOSS', connection, keypair, !refStage.label?.includes(':pumpportal'));
+        if (result === 'success') {
+          earlyPeakMap.delete(mint);
+          console.info(`[autosell] 💰 Early trail EXECUTED for ${mint.slice(0,8)}`);
+        } else {
+          console.error(`[autosell] 💰 Early trail FAILED for ${mint.slice(0,8)}`);
+        }
+        continue;
       }
     }
 
     // ── Trailing stop (active only after first TP stage executed) ────────────
-    if (TRAIL_PCT > 0 && refStage.sell_stage_reached >= 1) {
+    const effectiveTrailPct = jobTier.trailPct || TRAIL_PCT;
+    if (effectiveTrailPct > 0 && refStage.sell_stage_reached >= 1) {
       const peak = peakPriceMap.get(mint) ?? currentPriceSol;
       const newPeak = Math.max(peak, currentPriceSol);
       peakPriceMap.set(mint, newPeak);
-      const trailStop = newPeak * (1 - TRAIL_PCT);
+      const trailStop = newPeak * (1 - effectiveTrailPct);
       if (currentPriceSol < trailStop) {
-        console.warn(
-          `[autosell] 📉 TRAILING STOP triggered for ${mint.slice(0,8)} — ` +
-          `price ${currentPriceSol.toFixed(12)} < trail ${trailStop.toFixed(12)} ` +
-          `(${(TRAIL_PCT * 100).toFixed(0)}% from peak ${newPeak.toFixed(12)})`
-        );
-        const result = await claimAndSell(mint, refStage.autobuy_job_id, 100, 'STOP_LOSS', connection, keypair);
-        if (result === 'success') {
-          peakPriceMap.delete(mint);
-          console.info(`[autosell] 📉 Trailing stop EXECUTED for ${mint.slice(0,8)}`);
+        const confirms = (stopLossConfirmCount.get(mint) ?? 0) + 1;
+        stopLossConfirmCount.set(mint, confirms);
+        if (confirms < STOP_LOSS_CONFIRMS_REQUIRED) {
+          console.debug(`[autosell] 📉 Trail below ${mint.slice(0,8)} (${confirms}/${STOP_LOSS_CONFIRMS_REQUIRED})`);
         } else {
-          console.error(`[autosell] 📉 Trailing stop FAILED for ${mint.slice(0,8)}`);
+          stopLossConfirmCount.delete(mint);
+          console.warn(
+            `[autosell] 📉 TRAILING STOP confirmed for ${mint.slice(0,8)} — ` +
+            `price ${currentPriceSol.toFixed(12)} < trail ${trailStop.toFixed(12)} ` +
+            `(${(effectiveTrailPct * 100).toFixed(0)}% from peak ${newPeak.toFixed(12)})`
+          );
+          const result = await claimAndSell(mint, refStage.autobuy_job_id, 100, 'STOP_LOSS', connection, keypair, !refStage.label?.includes(':pumpportal'));
+          if (result === 'success') {
+            peakPriceMap.delete(mint);
+            console.info(`[autosell] 📉 Trailing stop EXECUTED for ${mint.slice(0,8)}`);
+          } else {
+            console.error(`[autosell] 📉 Trailing stop FAILED for ${mint.slice(0,8)}`);
+          }
+          continue;
         }
-        continue;
+      } else {
+        if (stopLossConfirmCount.has(mint)) stopLossConfirmCount.delete(mint);
       }
     }
 
-    // ── Stop-loss check ───────────────────────────────────────────────────────
+    // ── Stop-loss check (with stop-hunt protection) ───────────────────────────
     if (STOP_LOSS_PCT > 0) {
-      const refEntry = Number(refStage.entry_price_sol ?? 0);
-      if (refEntry > 0 && currentPriceSol < refEntry * (1 - STOP_LOSS_PCT)) {
-        console.warn(
-          `[autosell] 🛑 STOP-LOSS triggered for ${mint.slice(0,8)} — ` +
-          `price ${currentPriceSol.toFixed(12)} < stop ${(refEntry * (1 - STOP_LOSS_PCT)).toFixed(12)} ` +
-          `(${(STOP_LOSS_PCT * 100).toFixed(0)}% below entry)`
-        );
-        const result = await claimAndSell(mint, refStage.autobuy_job_id, 100, 'STOP_LOSS', connection, keypair);
-        if (result === 'success') {
-          stopLossFailCount.delete(mint);
-          console.info(`[autosell] 🛑 Stop-loss EXECUTED for ${mint.slice(0,8)}`);
+      // Fresh tokens get slightly wider stop (10% vs 8%) to survive initial volatility.
+      // Use tier-specific stop-loss — T1/T2 = tight (5%), T3 = wider (8%, less volatile)
+      const effectiveStop = jobTier.stopPct || STOP_LOSS_PCT;
+
+      if (refEntry > 0 && currentPriceSol < refEntry * (1 - effectiveStop)) {  // refEntry declared above in activity tracking block
+        // Require N consecutive readings below stop before firing — filters out 1-candle stop hunts
+        const confirms = (stopLossConfirmCount.get(mint) ?? 0) + 1;
+        stopLossConfirmCount.set(mint, confirms);
+        if (confirms < STOP_LOSS_CONFIRMS_REQUIRED) {
+          console.debug(
+            `[autosell] ⚠️ Stop below ${mint.slice(0,8)} — ` +
+            `${currentPriceSol.toFixed(12)} < ${(refEntry * (1 - effectiveStop)).toFixed(12)} ` +
+            `(${confirms}/${STOP_LOSS_CONFIRMS_REQUIRED} confirms, waiting...)`
+          );
+          // Don't fire yet — check next cycle
         } else {
-          const fails = (stopLossFailCount.get(mint) ?? 0) + 1;
-          stopLossFailCount.set(mint, fails);
-          console.error(`[autosell] 🛑 Stop-loss FAILED (${fails}/${MAX_STOP_LOSS_FAILS}) for ${mint.slice(0,8)}`);
-          if (fails >= MAX_STOP_LOSS_FAILS) {
-            console.warn(`[autosell] 💀 ${mint.slice(0,8)} — ${MAX_STOP_LOSS_FAILS} stop-loss failures, marking as total loss`);
-            await query(
-              `UPDATE autosell_stages SET status = 'failed', sell_reason = 'STOP_LOSS_UNSELLABLE'
-               WHERE autobuy_job_id = $1 AND status = 'pending'`,
-              [refStage.autobuy_job_id]
-            );
-            await query(`UPDATE autobuy_jobs SET active = false WHERE id = $1`, [refStage.autobuy_job_id]);
+          stopLossConfirmCount.delete(mint);
+          console.warn(
+            `[autosell] 🛑 STOP-LOSS confirmed for ${mint.slice(0,8)} — ` +
+            `price ${currentPriceSol.toFixed(12)} < stop ${(refEntry * (1 - effectiveStop)).toFixed(12)} ` +
+            `(${(effectiveStop * 100).toFixed(0)}% below entry, ${STOP_LOSS_CONFIRMS_REQUIRED} confirms)`
+          );
+          const result = await claimAndSell(mint, refStage.autobuy_job_id, 100, 'STOP_LOSS', connection, keypair, !refStage.label?.includes(':pumpportal'));
+          if (result === 'success') {
             stopLossFailCount.delete(mint);
+            console.info(`[autosell] 🛑 Stop-loss EXECUTED for ${mint.slice(0,8)}`);
+          } else {
+            const fails = (stopLossFailCount.get(mint) ?? 0) + 1;
+            stopLossFailCount.set(mint, fails);
+            console.error(`[autosell] 🛑 Stop-loss FAILED (${fails}/${MAX_STOP_LOSS_FAILS}) for ${mint.slice(0,8)}`);
+            if (fails >= MAX_STOP_LOSS_FAILS) {
+              console.warn(`[autosell] 💀 ${mint.slice(0,8)} — ${MAX_STOP_LOSS_FAILS} stop-loss failures, marking as total loss`);
+              await query(
+                `UPDATE autosell_stages SET status = 'failed', sell_reason = 'STOP_LOSS_UNSELLABLE'
+                 WHERE autobuy_job_id = $1 AND status = 'pending'`,
+                [refStage.autobuy_job_id]
+              );
+              await query(`UPDATE autobuy_jobs SET active = false WHERE id = $1`, [refStage.autobuy_job_id]);
+              stopLossFailCount.delete(mint);
+            }
           }
+          continue;
         }
-        continue;
+      } else {
+        // Price recovered above stop — reset confirmation counter
+        if (stopLossConfirmCount.has(mint)) {
+          console.debug(`[autosell] ✅ ${mint.slice(0,8)} recovered above stop — resetting confirm count`);
+          stopLossConfirmCount.delete(mint);
+        }
       }
     }
 
@@ -409,7 +547,7 @@ async function checkAndExecuteSells(walletAddress: string) {
             `[time-limit] ⏰ TIME_LIMIT_EXPIRED for ${mint.slice(0,8)} — ` +
             `${elapsedMin}min of inactivity (limit: ${refStage.time_limit_seconds / 60}min) — selling 95%`
           );
-          const result = await claimAndSell(mint, refStage.autobuy_job_id, 95, 'TIME_LIMIT_EXPIRED', connection, keypair);
+          const result = await claimAndSell(mint, refStage.autobuy_job_id, 95, 'TIME_LIMIT_EXPIRED', connection, keypair, !refStage.label?.includes(':pumpportal'));
           if (result === 'success') {
             timeLimitFailCount.delete(mint);
             console.info(`[time-limit] ✅ TIME_LIMIT_EXPIRED sell EXECUTED for ${mint.slice(0,8)}`);
@@ -469,10 +607,16 @@ async function checkAndExecuteSells(walletAddress: string) {
         break;
       }
 
-      const sellResult = await executeAutoSell(
+      let sellResult = await executeAutoSell(
         { mintAddress: mint, tokenAmount: tokensToSell, slippageBps: AUTOSELL_SLIPPAGE_BPS },
         connection, keypair
       );
+      if (!sellResult.success) {
+        sellResult = await executeAutoSell(
+          { mintAddress: mint, tokenAmount: tokensToSell, slippageBps: AUTOSELL_SLIPPAGE_RETRY_BPS },
+          connection, keypair
+        );
+      }
 
       if (sellResult.success) {
         await query(
@@ -593,7 +737,7 @@ async function runBuyCycle() {
       if (job.autosell_enabled && actualTokensReceived > 0n && actualEntry) {
         await createSellStages(
           job.id, job.mint_address, keypair.publicKey.toBase58(),
-          actualEntry, actualTokensReceived
+          actualEntry, actualTokensReceived, job.label
         );
       }
     } else {
@@ -632,7 +776,9 @@ export async function startAutobuyScheduler() {
   console.info(`[autobuy] Sell stages: ${SELL_STAGES.map(s => `${s.multiplier}x(${s.sellPct}%)`).join(' → ')}`);
   console.info(`[autobuy] Slippage — buy: ${AUTOBUY_SLIPPAGE_BPS}bps, sell: ${AUTOSELL_SLIPPAGE_BPS}bps`);
   console.info(`[autobuy] Stop-loss: ${STOP_LOSS_PCT > 0 ? `${(STOP_LOSS_PCT * 100).toFixed(0)}%` : 'disabled'}`);
-  console.info(`[autobuy] Time limit: ${TIME_LIMIT_SECONDS / 60}min (activity threshold: ${(TIME_LIMIT_ACTIVITY_PCT * 100).toFixed(1)}%)`);
+  const earlyTrailPct = Number(process.env.EARLY_TRAIL_PCT || '6');
+  console.info(`[autobuy] Early trail: ${earlyTrailPct}% from peak (fires when trail-stop > entry, pre-TP1)`);
+  console.info(`[autobuy] Time limit: ${TIME_LIMIT_SECONDS / 60}min (activity threshold: ${(TIME_LIMIT_ACTIVITY_PCT * 100).toFixed(1)}% UP-only)`);
   console.info(`[autobuy] Auto-signal: ${AUTO_BUY_ENABLED ? 'ENABLED' : 'disabled'}`);
 
   let shouldStop = false;
@@ -647,10 +793,14 @@ export async function startAutobuyScheduler() {
       console.error('[autobuy] Stuck job cleanup error:', err);
     }
 
+    // processAutoSignals (score-80 pump.fun tokens) DISABLED — 100% loss rate:
+    // pump.fun tokens can't be sold via Jupiter or PumpPortal reliably → 0 SOL returned every time.
+    // Only Raydium direct scan is used for new positions.
+
     try {
-      if (walletAddress) await processAutoSignals(walletAddress);
+      if (walletAddress) await processRaydiumOpportunities(walletAddress);
     } catch (err) {
-      console.error('[autobuy] Auto-signal error:', err);
+      console.error('[autobuy] Raydium scan error:', err);
     }
 
     try { await runBuyCycle(); } catch (err) {

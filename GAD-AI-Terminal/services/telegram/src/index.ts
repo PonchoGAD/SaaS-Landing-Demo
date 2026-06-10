@@ -157,14 +157,24 @@ bot.onText(/\/start/, (msg) => {
 bot.onText(/\/help/, (msg) => {
   send(msg.chat.id,
     `*GAD AI Terminal — Commands*\n\n` +
-    `*Free (no subscription needed):*\n` +
-    `/start — main menu\n/subscribe — get access\n/status — subscription status\n/wallet <address> — link Solana wallet\n\n` +
-    `*Requires active subscription:*\n` +
-    `/trending — top tokens by AI score\n/new — recent tokens\n/highscore — AI ≥ 80\n/highrisk — risk ≥ 70\n` +
+    `*Free:*\n` +
+    `/start — main menu\n/subscribe — get access\n/status — subscription status\n/wallet <address> — link wallet\n\n` +
+    `*Analytics (subscription required):*\n` +
+    `/trending /new /highscore /highrisk\n` +
     `/token <mint> — token details\n/analyze <mint> — full GAD AI report\n` +
-    `/whales — top whale traders\n/signals — active signals\n` +
+    `/tokenscore <mint> — safety & transparency score\n` +
+    `/whales — top whale traders\n/signals — active signals\n\n` +
+    `*Trading Tools:*\n` +
     `/portfolio — positions & P&L\n/watchlist — your watchlist\n` +
-    `/autobuy list|add|stop|resume|delete`
+    `/autobuy list|add|stop|resume|delete\n\n` +
+    `*Trade Journal:*\n` +
+    `/journal — your trade history + P&L\n` +
+    `/riskpassport — personal risk profile\n\n` +
+    `*Alpha Engine:*\n` +
+    `/opportunity /lifecycle /regime /reputation /memory\n\n` +
+    `*Coin Launcher:*\n` +
+    `/launch — deploy token on Pump.fun\n` +
+    `/mycoins — your deployed tokens\n/exitcoin <ticker> — sell position`
   );
 });
 
@@ -394,6 +404,24 @@ bot.on('callback_query', async (query) => {
   const [action, param] = (query.data ?? '').split(':');
   const page = parseInt(param ?? '0', 10) || 0;
 
+  if (action === 'exitcoin_cancel') {
+    await bot.editMessageText('❌ Cancelled.', { chat_id: chatId, message_id: msgId }).catch(() => {});
+    return;
+  }
+  if (action === 'exitcoin_confirm') {
+    await bot.editMessageText('⏳ Selling...', { chat_id: chatId, message_id: msgId }).catch(() => {});
+    try {
+      const result = await apiPost(`/launcher/coins/${param}/sell`, { pct: 100 });
+      await bot.editMessageText(
+        `✅ *Sold!*\nReceived: ${result.solReceived?.toFixed(4)} SOL`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } catch (err: any) {
+      await bot.editMessageText(`❌ Sell failed: ${err.message}`, { chat_id: chatId, message_id: msgId }).catch(() => {});
+    }
+    return;
+  }
+
   if (action === 'subscribe') {
     const payUrl = `${SITE_URL}/pay?tg_id=${tgId}`;
     await send(chatId,
@@ -497,6 +525,166 @@ bot.on('callback_query', async (query) => {
     }
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TRADE JOURNAL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bot.onText(/\/journal/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const data = await apiGet('/journal?limit=15');
+  const { trades, summary } = data;
+  const s = summary ?? {};
+
+  const pnlSign = (s.total_pnl ?? 0) >= 0 ? '+' : '';
+  let text = `📖 *Trade Journal*\n\n`;
+  text += `Trades: *${s.total_trades ?? 0}* | WR: *${s.win_rate ?? 0}%* | PnL: *${pnlSign}${Number(s.total_pnl ?? 0).toFixed(4)} SOL*\n`;
+  text += `Wins: ${s.wins ?? 0} / Losses: ${s.losses ?? 0} / Zero: ${s.zero_exits ?? 0}\n`;
+  text += `Avg Hold: ${s.avg_hold_min ?? 0}min\n\n`;
+
+  if (!trades?.length) {
+    text += '_No trades with executed buys yet._';
+  } else {
+    text += trades.slice(0, 10).map((t: any, i: number) => {
+      const sym = t.symbol ?? t.mint_address?.slice(0, 8) ?? '?';
+      const pnl = t.pnl_sol != null ? `${Number(t.pnl_sol) >= 0 ? '+' : ''}${Number(t.pnl_sol).toFixed(4)} SOL` : '?';
+      const roi = t.roi_pct != null ? ` (${Number(t.roi_pct) >= 0 ? '+' : ''}${t.roi_pct}%)` : '';
+      const stage = t.sell_stage_reached ? ` S${t.sell_stage_reached}` : '';
+      const when = t.bought_at ? new Date(t.bought_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '?';
+      return `${i + 1}. *${sym}*${stage} ${pnl}${roi} — ${when}`;
+    }).join('\n');
+  }
+
+  send(msg.chat.id, text, {
+    reply_markup: { inline_keyboard: [[
+      { text: '📊 Risk Passport', callback_data: 'riskpassport' },
+      { text: '📥 Export CSV', url: `${SITE_URL.replace('gadai.shop', 'api.gadai.shop')}/journal/export` },
+    ]]}
+  });
+}));
+
+bot.onText(/\/riskpassport/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const data = await apiGet('/riskpassport');
+  const p = data.passport;
+
+  if (!p) return send(msg.chat.id, `📊 *Risk Passport*\n\nNo trades yet. Start trading to build your profile.\n\nUse /autobuy or let the bot scan automatically.`);
+
+  const profile_emoji = p.profile === 'DISCIPLINED' ? '🏆' : p.profile === 'LEARNING' ? '📚' : '⚠️';
+  const pnlSign = p.total_pnl_sol >= 0 ? '+' : '';
+
+  let text = `📊 *Risk Passport*\n\n`;
+  text += `${profile_emoji} Profile: *${p.profile}* | Risk Score: *${p.risk_score}/100*\n\n`;
+  text += `Trades: *${p.total_trades}* | WR: *${p.win_rate}%*\n`;
+  text += `PnL: *${pnlSign}${p.total_pnl_sol.toFixed(4)} SOL* (ROI: ${p.roi_pct >= 0 ? '+' : ''}${p.roi_pct}%)\n`;
+  text += `Avg Hold: *${p.avg_hold_min}min* | RR: *${p.risk_reward}*\n`;
+  text += `Wins: ${p.wins} / Losses: ${p.losses} / Zero: ${p.zero_exits}\n\n`;
+
+  text += `*By Tier:*\n`;
+  const { t1, t2, t3 } = p.tier_breakdown ?? {};
+  if (t1?.trades) text += `  T1 Micro: ${t1.trades} trades, WR: ${t1.win_rate ?? '?'}%\n`;
+  if (t2?.trades) text += `  T2 Small: ${t2.trades} trades, WR: ${t2.win_rate ?? '?'}%\n`;
+  if (t3?.trades) text += `  T3 Mid:   ${t3.trades} trades, WR: ${t3.win_rate ?? '?'}%\n`;
+
+  if (p.advice?.length) {
+    text += `\n*Advice:*\n`;
+    text += p.advice.map((a: string) => `• ${a}`).join('\n');
+  }
+
+  send(msg.chat.id, text);
+}));
+
+bot.onText(/\/tokenscore (.+)/, (msg, match) => guard(msg.chat.id, async () => {
+  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const mint = (match?.[1] ?? '').trim();
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) return send(msg.chat.id, '❌ Invalid mint address.');
+
+  await send(msg.chat.id, `🔍 Scoring \`${mint.slice(0, 12)}…\``);
+  const data = await apiGet(`/tokenscore/${mint}`);
+
+  const label_emoji =
+    data.label === 'SAFE'     ? '🟢' :
+    data.label === 'MODERATE' ? '🟡' :
+    data.label === 'RISKY'    ? '🟠' : '🔴';
+
+  const sym = data.symbol ?? mint.slice(0, 8);
+  let text = `${label_emoji} *TokenScore — ${sym}*\n\n`;
+  text += `Score: *${data.score}/100* — ${data.label}\n\n`;
+  text += `🛡 Rug Safety:    *${data.components?.rug_safety ?? 0}*/40\n`;
+  text += `💧 Liquidity:     *${data.components?.liquidity ?? 0}*/25\n`;
+  text += `👥 Community:     *${data.components?.community ?? 0}*/20\n`;
+  text += `📝 Transparency:  *${data.components?.transparency ?? 0}*/15\n\n`;
+  text += `Rug prob: ${data.rug_probability?.toFixed(0)}% | Holders: ${data.holder_count} | Age: ${data.age_days}d | Liq: $${Number(data.liquidity_usd ?? 0).toLocaleString()}\n`;
+
+  if (data.flags?.length) {
+    text += `\n⚠️ *Flags:*\n`;
+    text += data.flags.map((f: string) => `• ${f}`).join('\n');
+  }
+  text += `\n\n\`${mint}\``;
+
+  send(msg.chat.id, text, {
+    reply_markup: { inline_keyboard: [[{ text: '🤖 Full Analysis', callback_data: `analyze:${mint}` }]] }
+  });
+}));
+
+bot.onText(/\/launch/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const launchUrl = `${SITE_URL}/launch`;
+  send(msg.chat.id,
+    `🚀 *Honest Token Launcher*\n\n` +
+    `Deploy your token on Pump.fun with full transparency.\n\n` +
+    `*What you get:*\n` +
+    `• Token deployed on Pump.fun in <30 seconds\n` +
+    `• Your budget goes ONLY to initial liquidity\n` +
+    `• No coordinated buys, no fake volume\n` +
+    `• P&L tracking in /mycoins\n` +
+    `• Exit at market price via /exitcoin\n\n` +
+    `*Use the Dashboard to launch your token.*\n` +
+    `Choose a name, ticker, description, and budget.\n\n` +
+    `⚠️ Fair launch only. No pump-and-dump.`,
+    {
+      reply_markup: { inline_keyboard: [[
+        { text: '🚀 Open Launcher', url: `${SITE_URL}/dashboard` },
+        { text: '📋 My Tokens', callback_data: 'mycoins' },
+      ]]}
+    }
+  );
+}));
+
+// ─── Coin Launcher ────────────────────────────────────────────────────────────
+
+bot.onText(/\/mycoins/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const coins: any[] = await apiGet('/launcher/coins');
+  if (!coins.length) return send(msg.chat.id, '🚀 *My Tokens*\n\nNo tokens launched yet.\nUse the Dashboard to deploy your first token.');
+  const lines = coins.map((c: any) => {
+    const pnl  = Number(c.pnlSol);
+    const sign = pnl >= 0 ? '+' : '';
+    const icon = c.status === 'LIVE' ? '🟢' : c.status === 'SOLD' ? '🟣' : '🟡';
+    return `${icon} *${c.name}* ($${c.ticker}) — ${sign}${pnl.toFixed(4)} SOL\n   Status: ${c.status} | Invested: ${c.solInvested} SOL\n   \`${c.mintAddress}\``;
+  });
+  send(msg.chat.id, `🚀 *My Tokens (${coins.length})*\n\n${lines.join('\n\n')}\n\n_Use /exitcoin <ticker> to sell_`);
+}));
+
+bot.onText(/\/exitcoin (.+)/, (msg, match) => guard(msg.chat.id, async () => {
+  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const ticker = (match?.[1] ?? '').trim().toUpperCase();
+  const coins: any[] = await apiGet('/launcher/coins');
+  const coin = coins.find((c: any) => c.ticker.toUpperCase() === ticker && c.status === 'LIVE');
+  if (!coin) return send(msg.chat.id, `❌ LIVE token with ticker \`${ticker}\` not found.\nCheck /mycoins for your active tokens.`);
+
+  const confirmMsg = await send(msg.chat.id,
+    `⚠️ *Exit ${coin.name} ($${coin.ticker})?*\n\nThis will sell 100% of your position at market price.\nInvested: ${coin.solInvested} SOL`,
+    {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '🚨 YES — Sell Everything', callback_data: `exitcoin_confirm:${coin.mintAddress}` },
+          { text: '❌ Cancel', callback_data: 'exitcoin_cancel' }
+        ]]
+      }
+    }
+  );
+}));
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 bot.on('polling_error', (err) => log('error', 'polling:', err.message));

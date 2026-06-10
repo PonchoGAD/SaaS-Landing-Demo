@@ -17,12 +17,13 @@ const JUPITER_QUOTE_URL = 'https://api.jup.ag/swap/v1/quote';
 const JUPITER_SWAP_URL = 'https://api.jup.ag/swap/v1/swap';
 const LAMPORTS_PER_SOL = 1000000000;
 // ─── Staged sell config ───────────────────────────────────────────────────────
+// Calibrated June 2026: tokens peak at 1.05-1.22x, TP1 at 1.10x ensures partial exits on real winners.
 exports.SELL_STAGES = [
-    { stage: 1, multiplier: 1.3,  sellPct: 40 },  // +30%   → sell 40% (immediate risk reduction)
-    { stage: 2, multiplier: 2.0,  sellPct: 40 },  // +100%  → sell 40% remaining (recover capital)
-    { stage: 3, multiplier: 5.0,  sellPct: 40 },  // +400%  → sell 40% remaining
-    { stage: 4, multiplier: 10.0, sellPct: 50 },  // +900%  → sell half
-    { stage: 5, multiplier: 20.0, sellPct: 100 }, // +1900% → full exit (moonshot)
+    { stage: 1, multiplier: 1.05, sellPct: 50 },   // +5%  → lock half
+    { stage: 2, multiplier: 1.15, sellPct: 50 },   // +15% → lock rest
+    { stage: 3, multiplier: 3.0,  sellPct: 50 },
+    { stage: 4, multiplier: 7.0,  sellPct: 50 },
+    { stage: 5, multiplier: 15.0, sellPct: 100 },
 ];
 // ─── Keypair loader ───────────────────────────────────────────────────────────
 function loadKeypairFromString(raw) {

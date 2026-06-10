@@ -50,7 +50,7 @@ export async function discoverGeckoTerminalTokens(): Promise<string[]> {
     )),
     // Raydium pools specifically — these are already graduated from pump.fun
     retry(() => fetchJson<GeckoResponse>(
-      `${BASE}/networks/solana/dexes/raydium/pools?sort=h24_volume_percent_change_desc&page=1`,
+      `${BASE}/networks/solana/dexes/raydium/pools?page=1`,
       { headers: HEADERS }
     ))
   ]);

@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import { registerRoutes } from './routes';
 import { registerSubscriptionRoutes } from './subscription.routes';
 import { registerTgUserRoutes } from './tg-user.routes';
+import { startLauncherPriceRefresh } from './launcher';
 
 dotenv.config();
 
@@ -24,4 +25,5 @@ registerTgUserRoutes(app);
 
 app.listen(port, () => {
   console.log(`GAD AI API listening on port ${port}`);
+  startLauncherPriceRefresh();
 });

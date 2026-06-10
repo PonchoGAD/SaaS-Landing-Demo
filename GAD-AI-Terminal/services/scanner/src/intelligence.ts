@@ -382,11 +382,11 @@ export async function runIntelligenceEngines(
            whale_accumulation = $5, volume_breakout = $6, social_velocity = $7,
            alpha_similarity = $8, lifecycle_stage_bonus = $9, risk_penalty = $10,
            reason = $11, regime_adjusted = $12, expires_at = $13, created_at = now()`,
-    [tokenId, oppResult.opportunityScore, oppResult.confidence,
-     oppResult.components.narrativeMomentum, oppResult.components.whaleAccumulation,
-     oppResult.components.volumeBreakout, oppResult.components.socialVelocity,
-     oppResult.components.alphaSimilarity, oppResult.components.lifecycleBonus,
-     oppResult.components.riskPenalty, oppResult.reason,
+    [tokenId, Math.round(oppResult.opportunityScore ?? 0), oppResult.confidence,
+     Math.round(oppResult.components.narrativeMomentum ?? 0), Math.round(oppResult.components.whaleAccumulation ?? 0),
+     Math.round(oppResult.components.volumeBreakout ?? 0), Math.round(oppResult.components.socialVelocity ?? 0),
+     Math.round(oppResult.components.alphaSimilarity ?? 0), Math.round(oppResult.components.lifecycleBonus ?? 0),
+     Math.round(oppResult.components.riskPenalty ?? 0), oppResult.reason,
      oppResult.regimeAdjusted, expiresAt]
   );
 
@@ -425,7 +425,7 @@ export async function runIntelligenceEngines(
            avg_opportunity = (narrative_rotation.avg_opportunity * narrative_rotation.token_count + $3)
                               / (narrative_rotation.token_count + 1),
            updated_at = now()`,
-    [narrativeResult.tag, gadResult.gadScore, oppResult.opportunityScore]
+    [narrativeResult.tag, gadResult.gadScore, Math.round(oppResult.opportunityScore ?? 0)]
   ).catch(() => {});
 
   console.info(

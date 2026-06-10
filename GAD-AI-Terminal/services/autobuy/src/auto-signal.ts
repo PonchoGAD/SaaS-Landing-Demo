@@ -19,6 +19,10 @@
 
 import { query } from '@lib/db';
 import axios from 'axios';
+import { analyzeTrend }   from '@lib/trend';
+import { assessLiquidity } from '@lib/liqhealth';
+import { detectHype }     from '@lib/hype';
+import { detectBotActivity, randomTradeDelay } from '@lib/botshield';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -56,6 +60,33 @@ const PUMP_PORTAL_ENABLED = process.env.PUMP_PORTAL_ENABLED === 'true';
 // Thresholds for pump.fun tokens (lower since bonding curve has different dynamics)
 const PUMP_MIN_LIQUIDITY_USD = Number(process.env.PUMP_MIN_LIQUIDITY_USD || '3000');
 const PUMP_MIN_TOKEN_AGE_SEC = Number(process.env.PUMP_MIN_TOKEN_AGE_SEC || '1200'); // 20 min
+
+// ─── Birdeye Holder Check ─────────────────────────────────────────────────────
+// Min holder count before buying — tokens with <50 holders are whale traps
+const BIRDEYE_MIN_HOLDERS = Number(process.env.BIRDEYE_MIN_HOLDERS || '50');
+const BIRDEYE_API_KEY     = process.env.BIRDEYE_API_KEY ?? '';
+
+async function checkHolderMomentum(mint: string): Promise<{ ok: boolean; holders?: number; reason?: string }> {
+  if (!BIRDEYE_API_KEY) return { ok: true };  // skip if no key configured
+  try {
+    const r = await axios.get(
+      `https://public-api.birdeye.so/defi/token_overview?address=${mint}`,
+      {
+        headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' },
+        timeout: 5_000,
+      }
+    );
+    const d = r.data?.data;
+    if (!d) return { ok: true };
+    const holders = Number(d.holder ?? d.uniqueWallet24h ?? 0);
+    if (holders > 0 && holders < BIRDEYE_MIN_HOLDERS) {
+      return { ok: false, holders, reason: `only ${holders} holders (min ${BIRDEYE_MIN_HOLDERS})` };
+    }
+    return { ok: true, holders };
+  } catch {
+    return { ok: true };  // fail open — don't block trades if Birdeye is down
+  }
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -277,6 +308,346 @@ export async function processAutoSignals(walletAddress: string): Promise<void> {
       `[auto-signal] Opened ${newJobs} position(s). ` +
       `Active: ${activePositions + newJobs}/${MAX_AUTO_POSITIONS} ` +
       `Daily: ${(dailySpent + newJobs * AUTO_BUY_SOL).toFixed(4)}/${DAILY_MAX_SOL} SOL`
+    );
+  }
+}
+
+// ─── Raydium Direct Scanner ────────────────────────────────────────────────────
+// Bypass scanner alerts — directly query DexScreener for Raydium/Jupiter pairs.
+// Raydium tokens score 40-44 on GAD (never reach 80 alert threshold),
+// but they have real liquidity and are tradeable via Jupiter.
+// Uses DexScreener (not GeckoTerminal) to avoid rate-limiting scanner's endpoint.
+
+const DEXSCREENER_BASE = 'https://api.dexscreener.com/latest/dex';
+
+// Max liquidity — avoid large-cap tokens (slow movers)
+const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD || '500000');
+// Min 1h price change — only buy tokens with positive 1h trend (not necessarily large)
+const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '2');
+// Max 1h price change — don't buy tokens that already pumped hard (overextended)
+const RAYDIUM_MAX_PC1H = Number(process.env.RAYDIUM_MAX_PC1H || '25');
+// Min 5m price change — require active momentum RIGHT NOW (key entry signal)
+const RAYDIUM_MIN_PC5M = Number(process.env.RAYDIUM_MIN_PC5M || '0.5');
+// Max token age for Raydium scan — prefer fresh pairs (< 48h)
+const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(48 * 3600));
+// Min token age — avoid just-launched rugpulls
+const RAYDIUM_MIN_AGE_SEC = Number(process.env.MIN_TOKEN_AGE_SEC || '3600');  // 1h (was 2h)
+// Min vol/liq ratio — ensures real active trading (not stale pools)
+const RAYDIUM_MIN_VOL_LIQ_RATIO = Number(process.env.RAYDIUM_MIN_VOL_LIQ_RATIO || '0.10');
+
+// ─── Adaptive Tier System ─────────────────────────────────────────────────────
+// Different liquidity tiers need different strategies:
+//  T1 Micro  ($20k–$80k):  explosive volatility, 15min hold, TP1 8%
+//  T2 Small  ($80k–$250k): normal memecoin, 20min hold, TP1 5% (current default)
+//  T3 Mid    ($250k–$500k): steady runner, 60min hold, TP1 15%, wider stop
+export interface LiqTier {
+  tier: 1 | 2 | 3;
+  label: string;
+  timeLimitSec: number;
+  stopPct: number;      // stop-loss %
+  trailPct: number;     // trailing stop %
+  earlyTrailPct: number;
+  sellStages: Array<{ stage: number; multiplier: number; sellPct: number }>;
+}
+
+export function getLiqTier(liqUsd: number): LiqTier {
+  if (liqUsd <= 80000) return {
+    tier: 1, label: 't1',
+    timeLimitSec: 900,   // 15 min — micro-caps move fast, exit quickly
+    stopPct: 0.05,
+    trailPct: 0.08,
+    earlyTrailPct: 0.04,
+    sellStages: [
+      { stage: 1, multiplier: 1.08, sellPct: 60 },  // take 60% at +8%
+      { stage: 2, multiplier: 1.20, sellPct: 60 },  // take 60% of rest at +20%
+      { stage: 3, multiplier: 3.0,  sellPct: 50 },
+      { stage: 4, multiplier: 7.0,  sellPct: 100 },
+    ],
+  };
+  if (liqUsd <= 250000) return {
+    tier: 2, label: 't2',
+    timeLimitSec: 1200,  // 20 min — standard small-cap
+    stopPct: 0.05,
+    trailPct: 0.12,
+    earlyTrailPct: 0.04,
+    sellStages: [
+      { stage: 1, multiplier: 1.05, sellPct: 50 },
+      { stage: 2, multiplier: 1.15, sellPct: 50 },
+      { stage: 3, multiplier: 3.0,  sellPct: 50 },
+      { stage: 4, multiplier: 7.0,  sellPct: 50 },
+      { stage: 5, multiplier: 15.0, sellPct: 100 },
+    ],
+  };
+  return {
+    tier: 3, label: 't3',
+    timeLimitSec: 3600,  // 60 min — mid-caps need time to run
+    stopPct: 0.08,       // wider stop — less volatile, rarely dumps 8% fast
+    trailPct: 0.15,      // wider trail — let winners breathe
+    earlyTrailPct: 0.06,
+    sellStages: [
+      { stage: 1, multiplier: 1.15, sellPct: 30 },  // only take 30% at +15%
+      { stage: 2, multiplier: 1.40, sellPct: 30 },  // +40% take another 30%
+      { stage: 3, multiplier: 2.0,  sellPct: 30 },  // 2x take 30%
+      { stage: 4, multiplier: 5.0,  sellPct: 50 },
+      { stage: 5, multiplier: 10.0, sellPct: 100 },
+    ],
+  };
+}
+
+// Tokens to skip (SOL, stablecoins, wrapped, known non-memecoins)
+const SKIP_MINTS = new Set([
+  'So11111111111111111111111111111111111111112',
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+  'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
+  'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',
+  'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn',
+  '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs',
+  'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1',
+]);
+
+// Run at most once per RAYDIUM_SCAN_INTERVAL_MS (120s to avoid rate limits)
+let lastRaydiumScan = 0;
+const RAYDIUM_SCAN_INTERVAL_MS = 120_000;
+
+// ─── Fetch pairs from multiple sources ────────────────────────────────────────
+// Sources ordered by signal quality (most actionable first):
+//  1. DexScreener gainers     — tokens already moving UP now (highest signal)
+//  2. DexScreener new pairs   — fresh Raydium pools ($20k-$500k liq tier)
+//  3. DexScreener boosted     — promoted tokens with active community
+//  4. DexScreener profiles    — new tokens getting first attention
+//  5. Jupiter trending        — tokens with high Jupiter swap volume (= real trading)
+
+async function fetchTokenPairs(mintAddress: string): Promise<any | null> {
+  try {
+    const r = await axios.get(`${DEXSCREENER_BASE}/tokens/${mintAddress}`, { timeout: 5_000 });
+    const pairs: any[] = r.data?.pairs ?? [];
+    return pairs
+      .filter(x => JUPITER_DEX_IDS.includes(x.dexId?.toLowerCase() ?? '') && x.chainId === 'solana')
+      .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0] ?? null;
+  } catch { return null; }
+}
+
+async function fetchRaydiumPairs(): Promise<any[]> {
+  const results: any[] = [];
+
+  // Source 1: DexScreener search with momentum keywords — tokens actively gaining NOW
+  const momentumQueries = ['solana new', 'solana moon', 'raydium solana', 'solana pump'];
+  for (const q of momentumQueries) {
+    try {
+      const r = await axios.get(`${DEXSCREENER_BASE}/search?q=${encodeURIComponent(q)}`, { timeout: 6_000 });
+      const pairs: any[] = r.data?.pairs ?? [];
+      for (const p of pairs) {
+        if (p.chainId !== 'solana') continue;
+        if (!JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')) continue;
+        // Pre-filter: only include pairs with positive short-term momentum
+        const pc5m = Number(p.priceChange?.m5 ?? 0);
+        const pc1h = Number(p.priceChange?.h1 ?? 0);
+        if (pc5m > 0 || pc1h > 0) results.push(p);
+      }
+    } catch { /* skip */ }
+  }
+
+  // Source 2: DexScreener new pairs — freshly created Raydium pools
+  try {
+    const r = await axios.get(
+      `https://api.dexscreener.com/token-profiles/latest/v1`,
+      { timeout: 6_000 }
+    );
+    const items: any[] = r.data ?? [];
+    for (const item of items.slice(0, 20)) {  // top 20 newest
+      if (item.chainId !== 'solana') continue;
+      const pair = await fetchTokenPairs(item.tokenAddress);
+      if (pair) results.push(pair);
+    }
+  } catch { /* skip */ }
+
+  // Source 3: DexScreener boosted tokens — active community + volume
+  try {
+    const r = await axios.get(`https://api.dexscreener.com/token-boosts/top/v1`, { timeout: 6_000 });
+    const items: any[] = r.data ?? [];
+    for (const item of items.slice(0, 15)) {
+      if (item.chainId !== 'solana') continue;
+      const pair = await fetchTokenPairs(item.tokenAddress);
+      if (pair) results.push(pair);
+    }
+  } catch { /* skip */ }
+
+  // Source 4: Jupiter high-volume tokens (real on-chain trading activity)
+  // Jupiter /tokens/top returns tokens by swap volume — these have REAL demand
+  try {
+    const r = await axios.get(
+      `https://tokens.jup.ag/tokens?tags=community`,
+      { timeout: 6_000 }
+    );
+    const tokens: any[] = r.data ?? [];
+    // Take a random sample to avoid always checking same tokens
+    const sample = tokens
+      .filter((t: any) => t.chainId === 'solana' || !t.chainId)
+      .sort(() => Math.random() - 0.5)
+      .slice(0, 10);
+    for (const token of sample) {
+      const mint = token.address ?? token.mint;
+      if (!mint) continue;
+      const pair = await fetchTokenPairs(mint);
+      if (pair) results.push(pair);
+    }
+  } catch { /* skip */ }
+
+  return results;
+}
+
+export async function processRaydiumOpportunities(walletAddress: string): Promise<void> {
+  if (!AUTO_BUY_ENABLED || !walletAddress) return;
+
+  const now = Date.now();
+  if (now - lastRaydiumScan < RAYDIUM_SCAN_INTERVAL_MS) return;
+  lastRaydiumScan = now;
+
+  const dailySpent = await getDailySpent();
+  if (dailySpent >= DAILY_MAX_SOL) return;
+
+  const activePositions = await getActiveAutoPositions();
+  if (activePositions >= MAX_AUTO_POSITIONS) return;
+
+  let pairs: any[] = [];
+  try {
+    pairs = await fetchRaydiumPairs();
+  } catch (err: any) {
+    console.debug(`[raydium-scan] Fetch failed: ${err.message?.slice(0, 60)}`);
+    return;
+  }
+
+  console.info(`[raydium-scan] 🔍 Scanning ${pairs.length} pairs | Active: ${activePositions}/${MAX_AUTO_POSITIONS} | Daily: ${dailySpent.toFixed(4)}/${DAILY_MAX_SOL} SOL`);
+
+  // Deduplicate by mint AND by normalized symbol (prevent buying 3 "SpaceX" variants)
+  const seenMints = new Set<string>();
+  const seenSymbols = new Set<string>();
+  const uniquePairs: any[] = [];
+  for (const p of pairs) {
+    const mint = p.baseToken?.address;
+    const sym = (p.baseToken?.symbol ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+    if (!mint || seenMints.has(mint)) continue;
+    if (sym && seenSymbols.has(sym)) continue;
+    seenMints.add(mint);
+    if (sym) seenSymbols.add(sym);
+    uniquePairs.push(p);
+  }
+
+  let newJobs = 0;
+  let skipped = { liq: 0, age: 0, momentum: 0, vol: 0, cooldown: 0 };
+
+  for (const pair of uniquePairs) {
+    if (activePositions + newJobs >= MAX_AUTO_POSITIONS) break;
+    if (dailySpent + newJobs * AUTO_BUY_SOL >= DAILY_MAX_SOL) break;
+
+    // DexScreener pair structure
+    const liq    = pair.liquidity?.usd ?? 0;
+    const vol1h  = pair.volume?.h1 ?? 0;
+    const vol5m  = pair.volume?.m5 ?? 0;
+    const vol24h = pair.volume?.h24 ?? 0;
+    const pc1h   = Number(pair.priceChange?.h1  ?? 0);
+    const pc5m   = Number(pair.priceChange?.m5  ?? 0);
+    const pc6h   = Number(pair.priceChange?.h6  ?? 0);
+    const createdAt = pair.pairCreatedAt ? Number(pair.pairCreatedAt) : 0;
+    const ageSec = createdAt > 0 ? (now - createdAt) / 1000 : 999999;
+    const mint   = pair.baseToken?.address ?? '';
+
+    if (!mint || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) continue;
+    if (SKIP_MINTS.has(mint)) continue;
+
+    // ── Gate 1: Liquidity / volume basics ──
+    if (liq < MIN_LIQUIDITY_USD || liq > RAYDIUM_MAX_LIQUIDITY_USD || vol1h < MIN_VOLUME_H1_USD) { skipped.liq++; continue; }
+
+    // ── Gate 2: Age ──
+    if (ageSec > 0 && (ageSec < RAYDIUM_MIN_AGE_SEC || ageSec > RAYDIUM_MAX_AGE_SEC)) { skipped.age++; continue; }
+
+    // ── Gate 3: 5m momentum — buying DURING the move, not after ──
+    // pc5m > 0.5% = token is actively moving UP right now
+    // pc1h within [2%, 25%] = healthy 1h trend, not overextended
+    // pc6h > -15% = not in long-term downtrend
+    if (pc5m < RAYDIUM_MIN_PC5M) { skipped.momentum++; continue; }
+    if (pc1h < RAYDIUM_MIN_PC1H || pc1h > RAYDIUM_MAX_PC1H) { skipped.momentum++; continue; }
+    if (pc6h < -15) { skipped.momentum++; continue; }
+
+    // ── Gate 4: Volume quality ──
+    // vol/liq ratio > 10% = real trading activity
+    // vol5m * 12 > vol1h * 0.3 = 5m pace is at least 30% faster than hourly average (accelerating)
+    if (liq > 0 && vol1h / liq < RAYDIUM_MIN_VOL_LIQ_RATIO) { skipped.vol++; continue; }
+    if (vol1h > 0 && vol5m * 12 < vol1h * 0.25) { skipped.vol++; continue; }
+
+    if (await recentlyBought(mint)) { skipped.cooldown++; continue; }
+
+    // ── Multi-module signal validation ──
+    const trend = analyzeTrend(pair);
+    if (trend.signal === 'SELL' || trend.stage === 'DEAD') { skipped.momentum++; continue; }
+
+    const hype = detectHype(pair);
+    if (hype.exit_signal && !hype.entry_window) { skipped.momentum++; continue; }
+
+    const liqHealth = assessLiquidity(pair, 60, AUTO_BUY_SOL);
+    if (liqHealth.auto_exit || liqHealth.rug_risk >= 60) { skipped.liq++; continue; }
+
+    const shield = detectBotActivity(pair);
+    if (!shield.safe_to_trade) { skipped.momentum++; continue; }
+
+    // Apply bot-shield random delay before entry
+    if (shield.recommended_delay > 0) {
+      await randomTradeDelay(0, shield.recommended_delay * 1000);
+    }
+
+    // ── Gate 5: Birdeye holder momentum ──
+    const holderCheck = await checkHolderMomentum(mint);
+    if (!holderCheck.ok) {
+      console.info(`[raydium-scan] ⚠️ Skip ${mint.slice(0, 8)} — ${holderCheck.reason}`);
+      continue;
+    }
+
+    const slippage = shield.slippage_bps;
+
+    try {
+      const isFresh = ageSec < 6 * 3600;
+      const ageTag = isFresh ? `fresh${Math.round(ageSec / 3600)}h` : `aged`;
+      const tier = getLiqTier(liq);
+      const label = `auto:raydium_scan:liq${Math.round(liq / 1000)}k:${ageTag}:${tier.label}`;
+      await query(
+        `INSERT INTO autobuy_jobs
+           (mint_address, label, amount_sol, slippage_bps, interval_seconds,
+            wallet_address, autosell_enabled, time_limit_seconds, time_limit_enabled)
+         VALUES ($1, $2, $3, $4, $5, $6, true, $7, true)`,
+        [
+          mint,
+          label,
+          AUTO_BUY_SOL,
+          slippage,
+          86400,
+          walletAddress,
+          tier.timeLimitSec,  // tier-specific hold time
+        ]
+      );
+      console.info(
+        `[raydium-scan] ✅ Buy ${pair.baseToken?.symbol ?? mint.slice(0,8)} (${mint.slice(0,8)}) ` +
+        `[TIER${tier.tier} ${tier.timeLimitSec/60}min/${(tier.stopPct*100).toFixed(0)}%stop] ` +
+        `dex:${pair.dexId} liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} ` +
+        `5m:${pc5m.toFixed(1)}% 1h:${pc1h.toFixed(1)}% age:${(ageSec/3600).toFixed(1)}h ` +
+        `holders:${holderCheck.holders ?? 'n/a'} ` +
+        `trend:${trend.stage} hype:${hype.hype_stage}(${hype.hype_score}) slip:${slippage}bps`
+      );
+      newJobs++;
+    } catch (err: any) {
+      console.error(`[raydium-scan] Failed to create job for ${mint.slice(0, 8)}: ${err.message}`);
+    }
+  }
+
+  if (newJobs > 0) {
+    console.info(
+      `[raydium-scan] Opened ${newJobs} position(s). ` +
+      `Active: ${activePositions + newJobs}/${MAX_AUTO_POSITIONS} ` +
+      `Daily: ${(dailySpent + newJobs * AUTO_BUY_SOL).toFixed(4)}/${DAILY_MAX_SOL} SOL`
+    );
+  } else {
+    console.info(
+      `[raydium-scan] ❌ No entries — skip: liq/vol=${skipped.liq} age=${skipped.age} momentum=${skipped.momentum} ratio=${skipped.vol} cooldown=${skipped.cooldown}`
     );
   }
 }
