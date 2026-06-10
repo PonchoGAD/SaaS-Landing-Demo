@@ -468,67 +468,40 @@ async function fetchTokenPairs(mintAddress: string): Promise<any | null> {
 async function fetchRaydiumPairs(): Promise<any[]> {
   const results: any[] = [];
 
-  // Source 1: GeckoTerminal Raydium pools — direct DEX query, all pairs are guaranteed Raydium.
-  // Replaces DexScreener keyword searches that returned well-known tokens (BONK, WIF, SOL)
-  // which are silently filtered by SKIP_MINTS without appearing in any skip counter.
+  // Source 1: GeckoTerminal Raydium DEX pools — single call, handle 429 gracefully.
+  // Scanner also uses GeckoTerminal every 30s, so we stagger with a short delay
+  // and make only ONE GeckoTerminal call per cycle to avoid rate limiting.
+  await new Promise(r => setTimeout(r, 3000));
   try {
     const r = await axios.get(
       `${GECKO_BASE}/networks/solana/dexes/raydium/pools?page=1`,
       { headers: GECKO_HEADERS, timeout: 8_000 }
     );
-    for (const pool of (r.data?.data ?? [])) {
+    const pools = r.data?.data ?? [];
+    for (const pool of pools) {
       const pair = geckoPoolToPair(pool);
       if (pair) results.push(pair);
     }
-    console.debug(`[raydium-scan] GeckoTerminal raydium/pools: ${results.length} pairs`);
+    console.debug(`[raydium-scan] GeckoTerminal raydium/pools: ${pools.length} pairs`);
   } catch (e: any) {
-    console.debug(`[raydium-scan] GeckoTerminal raydium/pools error: ${e.message?.slice(0, 60)}`);
+    const status = (e as any).response?.status ?? '';
+    console.debug(`[raydium-scan] GeckoTerminal raydium/pools ${status || e.message?.slice(0, 40)} — using DexScreener only`);
   }
 
-  // Source 2: GeckoTerminal new Solana pools → DexScreener lookup for full m5 data
+  // Source 2: DexScreener newest token profiles
   try {
-    const r = await axios.get(
-      `${GECKO_BASE}/networks/solana/new_pools?page=1`,
-      { headers: GECKO_HEADERS, timeout: 8_000 }
-    );
-    const newMints: string[] = (r.data?.data ?? []).slice(0, 15)
-      .map((p: any) => (p.relationships?.base_token?.data?.id ?? '').split('_')[1])
-      .filter(Boolean);
-    for (const mint of newMints) {
-      const pair = await fetchTokenPairs(mint);
-      if (pair) results.push(pair);
-    }
-  } catch { /* skip */ }
-
-  // Source 3: GeckoTerminal trending Solana pools → DexScreener lookup for full m5 data
-  try {
-    const r = await axios.get(
-      `${GECKO_BASE}/networks/solana/trending_pools?page=1`,
-      { headers: GECKO_HEADERS, timeout: 8_000 }
-    );
-    const trendMints: string[] = (r.data?.data ?? []).slice(0, 15)
-      .map((p: any) => (p.relationships?.base_token?.data?.id ?? '').split('_')[1])
-      .filter(Boolean);
-    for (const mint of trendMints) {
-      const pair = await fetchTokenPairs(mint);
-      if (pair) results.push(pair);
-    }
-  } catch { /* skip */ }
-
-  // Source 4: DexScreener newest token profiles
-  try {
-    const r = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
-    for (const item of (r.data ?? []).slice(0, 20)) {
+    const r2 = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
+    for (const item of (r2.data ?? []).slice(0, 20)) {
       if (item.chainId !== 'solana') continue;
       const pair = await fetchTokenPairs(item.tokenAddress);
       if (pair) results.push(pair);
     }
   } catch { /* skip */ }
 
-  // Source 5: DexScreener active boosts — tokens with active ad spend → real community
+  // Source 3: DexScreener active boosts — tokens with active ad spend → real community
   try {
-    const r = await axios.get('https://api.dexscreener.com/token-boosts/active/v1', { timeout: 6_000 });
-    for (const item of (r.data ?? []).slice(0, 15)) {
+    const r3 = await axios.get('https://api.dexscreener.com/token-boosts/active/v1', { timeout: 6_000 });
+    for (const item of (r3.data ?? []).slice(0, 15)) {
       if (item.chainId !== 'solana') continue;
       const pair = await fetchTokenPairs(item.tokenAddress);
       if (pair) results.push(pair);
