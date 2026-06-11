@@ -113,7 +113,8 @@ async function getQuote(
   inputMint: string,
   outputMint: string,
   amount: number,
-  slippageBps: number
+  slippageBps: number,
+  attempt = 0
 ): Promise<JupiterQuoteResponse> {
   const params = new URLSearchParams({
     inputMint,
@@ -121,8 +122,19 @@ async function getQuote(
     amount: String(amount),
     slippageBps: String(slippageBps)
   });
-  const res = await axios.get<JupiterQuoteResponse>(`${JUPITER_QUOTE_URL}?${params}`, { timeout: 10_000 });
-  return res.data;
+  try {
+    const res = await axios.get<JupiterQuoteResponse>(`${JUPITER_QUOTE_URL}?${params}`, { timeout: 10_000 });
+    return res.data;
+  } catch (err: any) {
+    // Retry on 429 with exponential backoff: 5s, 10s, 20s
+    if (err?.response?.status === 429 && attempt < 3) {
+      const wait = (attempt + 1) * 5_000;
+      console.warn(`[jupiter] Quote 429 — waiting ${wait / 1000}s before retry ${attempt + 2}/4...`);
+      await new Promise(r => setTimeout(r, wait));
+      return getQuote(inputMint, outputMint, amount, slippageBps, attempt + 1);
+    }
+    throw err;
+  }
 }
 
 async function getSwapTransaction(
