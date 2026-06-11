@@ -11,6 +11,7 @@ import { sellViaPumpPortal, buyViaPumpPortal } from './pumpportal';
 import { PublicKey } from '@solana/web3.js';
 import { processAutoSignals, processRaydiumOpportunities, AUTO_BUY_ENABLED, getLiqTier } from './auto-signal';
 import { startGraduationScanner } from './graduation-scanner';
+import { startBondingScanner } from './bonding-scanner';
 
 const POLL_MS    = Number(process.env.AUTOBUY_POLL_SECONDS  || '15') * 1000;
 const MAX_ERRORS = Number(process.env.AUTOBUY_MAX_ERRORS    || '5');
@@ -791,6 +792,9 @@ export async function startAutobuyScheduler() {
 
   // Start real-time graduation scanner (WebSocket — sub-second latency for pump.fun graduates)
   if (walletAddress) startGraduationScanner(walletAddress);
+
+  // Start bonding curve scanner — buys tokens BEFORE graduation using PUMPFUN_WALLET
+  startBondingScanner();
 
   while (!shouldStop) {
     try { await deactivateStuckJobs(); } catch (err) {
