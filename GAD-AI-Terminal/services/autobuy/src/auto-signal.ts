@@ -510,7 +510,9 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   //  "new token sol" / "solana new" → fresh launches and pump.fun graduates
   //  "raydium solana" / "sol pump"  → established memecoins getting KOL-driven pump
   //  "moon sol"                     → tokens with community momentum
-  const queries = ['new token sol', 'raydium solana', 'solana new', 'sol pump', 'moon sol'];
+  // "moon sol" returns 3-yr-old tokens (DMOON/SHDW). "sol pump" returns 0 sol_dex. Removed.
+  // "sol gem" and "sol launch" surface micro-caps being hyped as fresh discoveries.
+  const queries = ['new token sol', 'sol gem', 'solana new', 'sol meme', 'sol launch'];
 
   for (const q of queries) {
     try {
