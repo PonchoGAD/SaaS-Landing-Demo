@@ -505,14 +505,15 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   const seen = new Set<string>();
   const results: any[] = [];
 
-  // Source 1: GeckoTerminal new pools — 5 pages = up to 100 newest Solana pools.
-  // Best discovery source: sorted by creation time, includes txn buy/sell counts.
+  // Source 1: GeckoTerminal trending pools pages 2-4.
+  // Page 1 is already consumed by the scanner service — we use pages 2-4 to avoid collision.
+  // trending_pools = sorted by vol/liq momentum score = high-signal actionable entries.
   // geckoPoolToPair() filters to Raydium/Orca/Meteora/Lifinity only; skips pump.fun etc.
   let geckoCount = 0;
-  for (let page = 1; page <= 5; page++) {
+  for (let page = 2; page <= 4; page++) {
     try {
       const r = await axios.get(
-        `${GECKO_BASE}/networks/solana/new_pools?page=${page}&include=base_token,dex`,
+        `${GECKO_BASE}/networks/solana/trending_pools?page=${page}&include=base_token,dex`,
         { headers: GECKO_HEADERS, timeout: 8_000 }
       );
       const pools: any[] = r.data?.data ?? [];
@@ -525,23 +526,36 @@ async function fetchRaydiumPairs(): Promise<any[]> {
         results.push(pair);
         geckoCount++;
       }
+      // 400ms between pages to avoid burst rate limit with scanner service
+      await new Promise(r => setTimeout(r, 400));
     } catch (e: any) {
       const status = (e as any).response?.status ?? (e as any).code;
-      console.debug(`[raydium-scan] GeckoTerminal new_pools page ${page}: ${status ?? (e as any).message?.slice(0, 30)}`);
+      console.debug(`[raydium-scan] GeckoTerminal trending page ${page}: ${status ?? (e as any).message?.slice(0, 30)}`);
       break;
     }
   }
   if (geckoCount > 0) {
-    console.debug(`[raydium-scan] GeckoTerminal new_pools: ${geckoCount} Raydium/Orca pairs`);
+    console.debug(`[raydium-scan] GeckoTerminal trending p2-4: ${geckoCount} Raydium/Orca pairs`);
   }
 
-  // Source 2: DexScreener search — trending memecoins that may not be "new" but are pumping now.
-  // Supplements GeckoTerminal with KOL-revival tokens (days/weeks old, sudden momentum).
-  const queries = ['new token sol', 'sol gem', 'solana new', 'sol meme', 'sol launch'];
-  for (const q of queries) {
-    try {
-      const r = await axios.get(`${DEXSCREENER_BASE}/search?q=${encodeURIComponent(q)}`, { timeout: 6_000 });
-      const pairs: any[] = r.data?.pairs ?? [];
+  // Source 2: DexScreener token-boosts endpoint — recently promoted Solana tokens.
+  // These tokens have active communities paying for boosts = current hype = momentum trades.
+  // After fetching boost list, look up each token's Raydium pair for full data.
+  try {
+    const boostR = await axios.get('https://api.dexscreener.com/token-boosts/latest/v1', { timeout: 6_000 });
+    const boosts: any[] = Array.isArray(boostR.data) ? boostR.data : (boostR.data?.data ?? []);
+    const solMints = boosts
+      .filter(b => b.chainId === 'solana' && b.tokenAddress)
+      .map(b => b.tokenAddress as string)
+      .filter(m => !seen.has(m))
+      .slice(0, 20); // cap at 20 to avoid too many API calls
+    if (solMints.length > 0) {
+      // Batch fetch pairs for all boosted tokens in one call
+      const pairR = await axios.get(
+        `${DEXSCREENER_BASE}/tokens/${solMints.join(',')}`,
+        { timeout: 8_000 }
+      );
+      const pairs: any[] = pairR.data?.pairs ?? [];
       let added = 0;
       for (const p of pairs) {
         if (p.chainId !== 'solana') continue;
@@ -549,16 +563,17 @@ async function fetchRaydiumPairs(): Promise<any[]> {
         const mint = p.baseToken?.address;
         if (!mint || seen.has(mint)) continue;
         seen.add(mint);
-        const pc1h = Number(p.priceChange?.h1 ?? 0);
-        if (pc1h >= 0) { results.push(p); added++; }
+        results.push(p);
+        added++;
       }
-      if (added > 0) console.debug(`[raydium-scan] search "${q}": ${added} new candidates`);
-    } catch (e: any) {
-      console.debug(`[raydium-scan] search "${q}" error: ${(e as any).message?.slice(0, 40)}`);
+      if (added > 0) console.debug(`[raydium-scan] DexScreener boosts: ${added} Raydium pairs from ${solMints.length} boosted tokens`);
     }
+  } catch (e: any) {
+    console.debug(`[raydium-scan] boosts error: ${(e as any).message?.slice(0, 40)}`);
   }
 
-  console.debug(`[raydium-scan] total: ${results.length} unique candidates (${geckoCount} gecko + ${results.length - geckoCount} dexscreener)`);
+  const dxCount = results.length - geckoCount;
+  console.debug(`[raydium-scan] total: ${results.length} unique candidates (${geckoCount} gecko + ${dxCount} boosts)`);
   return results;
 }
 
