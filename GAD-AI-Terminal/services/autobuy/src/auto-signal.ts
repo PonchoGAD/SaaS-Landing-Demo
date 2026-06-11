@@ -342,17 +342,17 @@ const GECKO_HEADERS = { 'Accept': 'application/json;version=20230302' };
 const RAYDIUM_MIN_LIQUIDITY_USD = Number(process.env.RAYDIUM_MIN_LIQUIDITY_USD || '8000');
 // Max liquidity — avoid large-cap tokens (slow movers)
 const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD || '500000');
-// Min 1h volume — real trading activity (lower than auto-signal, graduated tokens start slow)
-const RAYDIUM_MIN_VOLUME_H1_USD = Number(process.env.RAYDIUM_MIN_VOLUME_H1_USD || '2000');
+// Min 1h volume — $500 floor; vol/liq ratio gate (10%) is the real quality check for stale pools
+const RAYDIUM_MIN_VOLUME_H1_USD = Number(process.env.RAYDIUM_MIN_VOLUME_H1_USD || '500');
 // Min 1h price change — require positive momentum (5% = significant, filters noise)
 const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '5');
 // Max 1h price change — allow strong pumps (pump.fun graduates often 50-100% in first hour)
 const RAYDIUM_MAX_PC1H = Number(process.env.RAYDIUM_MAX_PC1H || '100');
 // Min 5m price change — require active momentum RIGHT NOW (key entry signal)
 const RAYDIUM_MIN_PC5M = Number(process.env.RAYDIUM_MIN_PC5M || '0.5');
-// Max token age — 7 days covers "rediscovered" pumpers (tokens sitting flat then getting KOL pump).
-// 48h was too restrictive: real pumping tokens on Raydium are often 2-10 days old.
-const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(7 * 24 * 3600));
+// Max token age — 14 days covers "rediscovered" pumpers (tokens sitting flat then getting KOL pump).
+// 7 days was still too restrictive: SATX example was 9.4 days old and pumping +28% in 1h.
+const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(14 * 24 * 3600));
 // Min token age — 30min prevents buying in the first minutes of Raydium launch
 // Uses own env var, NOT MIN_TOKEN_AGE_SEC (which is 2h for auto-signal strategy)
 const RAYDIUM_MIN_AGE_SEC = Number(process.env.RAYDIUM_MIN_AGE_SEC || '1800');
@@ -599,27 +599,47 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     if (!mint || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) continue;
     if (SKIP_MINTS.has(mint)) { skipped.known++; continue; }
 
+    const sym = pair.baseToken?.symbol ?? mint.slice(0, 8);
+
     // ── Gate 1: Liquidity / volume basics ──
-    if (liq < RAYDIUM_MIN_LIQUIDITY_USD || liq > RAYDIUM_MAX_LIQUIDITY_USD || vol1h < RAYDIUM_MIN_VOLUME_H1_USD) { skipped.liq++; continue; }
+    if (liq < RAYDIUM_MIN_LIQUIDITY_USD || liq > RAYDIUM_MAX_LIQUIDITY_USD || vol1h < RAYDIUM_MIN_VOLUME_H1_USD) {
+      console.debug(`[raydium-scan] ✗liq  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
+      skipped.liq++; continue;
+    }
 
     // ── Gate 2: Age ──
-    if (ageSec > 0 && (ageSec < RAYDIUM_MIN_AGE_SEC || ageSec > RAYDIUM_MAX_AGE_SEC)) { skipped.age++; continue; }
+    if (ageSec > 0 && (ageSec < RAYDIUM_MIN_AGE_SEC || ageSec > RAYDIUM_MAX_AGE_SEC)) {
+      console.debug(`[raydium-scan] ✗age  ${sym.padEnd(10)} age:${(ageSec/3600).toFixed(1)}h liq:$${liq.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
+      skipped.age++; continue;
+    }
 
     // ── Gate 3: momentum ──
     // Skip pc5m check when vol5m=0 (GeckoTerminal source has no m5 data).
     // pc1h and pc6h are always available.
-    if (vol5m > 0 && pc5m < RAYDIUM_MIN_PC5M) { skipped.momentum++; continue; }
-    if (pc1h < RAYDIUM_MIN_PC1H || pc1h > RAYDIUM_MAX_PC1H) { skipped.momentum++; continue; }
+    if (vol5m > 0 && pc5m < RAYDIUM_MIN_PC5M) {
+      console.debug(`[raydium-scan] ✗mom  ${sym.padEnd(10)} pc5m:${pc5m.toFixed(1)}% liq:$${liq.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
+      skipped.momentum++; continue;
+    }
+    if (pc1h < RAYDIUM_MIN_PC1H || pc1h > RAYDIUM_MAX_PC1H) {
+      console.debug(`[raydium-scan] ✗mom  ${sym.padEnd(10)} pc1h:${pc1h.toFixed(1)}% liq:$${liq.toFixed(0)}`);
+      skipped.momentum++; continue;
+    }
     // For tokens older than 6h, require positive 6h trend — don't buy downtrends.
     // Fresh tokens (<6h) may not have meaningful 6h data yet.
-    if (ageSec > 6 * 3600 && pc6h <= 0) { skipped.momentum++; continue; }
+    if (ageSec > 6 * 3600 && pc6h <= 0) {
+      console.debug(`[raydium-scan] ✗trend ${sym.padEnd(10)} pc6h:${pc6h.toFixed(1)}% age:${(ageSec/3600).toFixed(1)}h liq:$${liq.toFixed(0)}`);
+      skipped.momentum++; continue;
+    }
     if (pc6h < -15) { skipped.momentum++; continue; }
 
     // ── Gate 4: Volume quality ──
     // vol/liq ratio > 10% = real trading activity
     // vol acceleration check only when 5m data is available (vol5m > 0).
     // Without m5 data, vol5m*12 < vol1h*0.25 always triggers (0 < anything) — false positive.
-    if (liq > 0 && vol1h / liq < RAYDIUM_MIN_VOL_LIQ_RATIO) { skipped.vol++; continue; }
+    if (liq > 0 && vol1h / liq < RAYDIUM_MIN_VOL_LIQ_RATIO) {
+      console.debug(`[raydium-scan] ✗ratio ${sym.padEnd(10)} vol/liq:${(vol1h/liq*100).toFixed(1)}% vol1h:$${vol1h.toFixed(0)} liq:$${liq.toFixed(0)}`);
+      skipped.vol++; continue;
+    }
     if (vol5m > 0 && vol1h > 0 && vol5m * 12 < vol1h * 0.25) { skipped.vol++; continue; }
 
     if (await recentlyBought(mint)) { skipped.cooldown++; continue; }
